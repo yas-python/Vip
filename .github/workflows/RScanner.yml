@@ -1,41 +1,198 @@
 name: Rust Proxy Scanner
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   schedule:
-    - cron: '0 */24 * * *' 
+    # Daily at 00:00 UTC
+    - cron: '0 0 * * *'
 
 jobs:
   update-proxies:
     runs-on: ubuntu-latest
-    name: Scan and test proxies
+    name: Scan, pick best IP, update Cloudflare, redeploy, cleanup
+
+    env:
+      # Cloudflare Pages project name (exactly as in the dashboard)
+      CF_PROJECT_NAME: zizfin
+      # Variable name to store the proxy IP in Cloudflare Pages → Variables and Secrets
+      CF_VAR_NAME: PROXYIP
+      # Number of recent deployments to keep
+      KEEP_DEPLOYMENTS: '5'
 
     steps:
-    - name: Checkout Repository
+    - name: Checkout repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Install Rust Toolchain
+    - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Build Rust Project (Release)
+    - name: Build Rust project (release)
       run: cargo build --release
 
-    - name: Give Execute Permission to Binary
-      run: chmod +x ./target/release/RScanner
+    - name: Ensure jq is available
+      run: sudo apt-get update && sudo apt-get install -y jq
 
-    - name: 💀 Run Scanner
-      run: ./target/release/RScanner
-
-    - name: Commit and Push if Changed
-      if: ${{ success() }}
+    - name: Run scanner and extract best IP
+      id: scan
+      shell: bash
       run: |
+        set -euo pipefail
+
+        BIN="./target/release/RScanner"
+        chmod +x "$BIN"
+
+        # Run the scanner and save output
+        # Assumption: Scanner prints a line like:
+        # Best Proxy IP: 104.21.2.205:443
+        # If format differs, adjust the grep patterns accordingly.
+        "$BIN" 2>&1 | tee scan.log || true
+
+        # If a report file exists, we can commit later
+        if [ -f sub/ProxyIP-Daily.md ]; then
+          echo "Scanner updated: sub/ProxyIP-Daily.md"
+        fi
+
+        # Try to find the best IP line
+        BEST_LINE="$(grep -Eio 'best (proxy )?ip[^:]*:\s*[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?' scan.log | tail -n1 || true)"
+        if [ -z "${BEST_LINE}" ]; then
+          # Fallback: match common lines like
+          # [VVV] 104.248.63.17:30588 (0.18 sec)
+          BEST_LINE="$(grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?\s*\([0-9.]+\s*sec\)' scan.log | sort -hk2 | head -n1 || true)"
+        fi
+
+        if [ -z "${BEST_LINE}" ]; then
+          echo "ERROR: Could not parse best IP from scanner output."
+          echo "---- scanner output (first 200 lines) ----"
+          sed -n '1,200p' scan.log || true
+          exit 1
+        fi
+
+        # Extract IP[:PORT]
+        BEST_IP="$(echo "$BEST_LINE" | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?' | head -n1)"
+
+        # Validate IP
+        if ! echo "$BEST_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?$'; then
+          echo "ERROR: Parsed BEST_IP is invalid: '$BEST_IP'"
+          exit 1
+        fi
+
+        echo "Best IP found: $BEST_IP"
+        echo "best_ip=$BEST_IP" >> "$GITHUB_OUTPUT"
+
+    - name: Commit and push IP report if changed
+      if: ${{ success() }}
+      shell: bash
+      run: |
+        set -euo pipefail
         git config --global user.name "NET Sentinel Bot"
         git config --global user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
-        git add sub/ProxyIP-Daily.md
-        git diff --cached --quiet || git commit -m "Proxy IPs test completion at: $(TZ='Asia/Tehran' date '+%H:%M:%S')"
-        git -c committer.name="Diana-Cl" -c committer.email="135276904+Diana-Cl@users.noreply.github.com" commit --amend --no-edit
-        git push origin main --force
+        if git ls-files --error-unmatch sub/ProxyIP-Daily.md >/dev/null 2>&1; then
+          git add sub/ProxyIP-Daily.md
+          git diff --cached --quiet || git commit -m "Proxy IPs test completion at: $(TZ='Asia/Tehran' date '+%H:%M:%S')"
+          git push origin main
+        else
+          echo "No ProxyIP-Daily.md to commit."
+        fi
+
+    - name: Update Cloudflare Pages variable (PROXYIP)
+      id: cf-var
       shell: bash
+      env:
+        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      run: |
+        set -euo pipefail
+        BEST_IP="${{ steps.scan.outputs.best_ip }}"
+        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
+        CF_VAR="${{ env.CF_VAR_NAME }}"
+
+        # Update project env var (persistent in Settings → Variables and Secrets)
+        PAYLOAD="$(jq -n --arg name "$CF_PROJECT" \
+                        --arg var "$CF_VAR" \
+                        --arg val "$BEST_IP" \
+                        '{name: $name, env_vars: {($var): {value: $val, type: "plain_text"}}}')"
+
+        curl -sS -X PATCH "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "${PAYLOAD}" | tee cf_update_var.json
+
+        if ! jq -e '.success == true' cf_update_var.json >/dev/null; then
+          echo "ERROR: Cloudflare variable update failed"
+          jq '.errors // empty' cf_update_var.json || true
+          exit 1
+        fi
+
+        echo "Cloudflare variable ${CF_VAR} updated to ${BEST_IP}"
+
+    - name: Trigger redeploy
+      id: cf-deploy
+      shell: bash
+      env:
+        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      run: |
+        set -euo pipefail
+        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
+
+        # Create a new deployment (Pages → Deployments)
+        curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data '{}' | tee cf_new_deploy.json
+
+        if ! jq -e '.success == true' cf_new_deploy.json >/dev/null; then
+          echo "ERROR: Cloudflare deployment trigger failed"
+          jq '.errors // empty' cf_new_deploy.json || true
+          exit 1
+        fi
+
+        DEPLOY_ID="$(jq -r '.result.id' cf_new_deploy.json)"
+        echo "deploy_id=${DEPLOY_ID}" >> "$GITHUB_OUTPUT"
+        echo "Triggered new deployment: ${DEPLOY_ID}"
+
+    - name: Cleanup old deployments (keep last N)
+      if: ${{ success() }}
+      shell: bash
+      env:
+        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      run: |
+        set -euo pipefail
+        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
+        KEEP="${{ env.KEEP_DEPLOYMENTS }}"
+
+        # List latest deployments
+        curl -sS -G "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          --data-urlencode "per_page=50" \
+          | tee cf_list_deploys.json
+
+        if ! jq -e '.success == true' cf_list_deploys.json >/dev/null; then
+          echo "WARN: Could not list deployments; skipping cleanup."
+          exit 0
+        fi
+
+        # Newest → oldest
+        IDS=( $(jq -r '.result | sort_by(.created_on) | reverse | .[].id' cf_list_deploys.json) )
+        COUNT="${#IDS[@]}"
+        echo "Found ${COUNT} deployments"
+
+        if [ "$COUNT" -le "$KEEP" ]; then
+          echo "No cleanup needed (<= ${KEEP})"
+          exit 0
+        fi
+
+        # Delete extras from the end
+        for ((i=KEEP; i<COUNT; i++)); do
+          ID="${IDS[$i]}"
+          echo "Deleting old deployment: ${ID}"
+          curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments/${ID}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -o /dev/null || echo "WARN: delete failed for ${ID}"
+        done
+
+        echo "Cleanup complete."
