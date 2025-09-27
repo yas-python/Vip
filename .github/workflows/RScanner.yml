@@ -1,5 +1,4 @@
 name: Rust Proxy Scanner (Ultimate)
-
 on:
   workflow_dispatch:
   schedule:
@@ -29,43 +28,37 @@ jobs:
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
-
+    
     - name: Setup environment (install tools & Python deps)
       run: |
         set -euo pipefail
         sudo apt-get update -y
         sudo apt-get install -y jq curl ca-certificates python3 python3-pip netcat-openbsd
         python3 -m pip install --no-cache-dir requests
-
+    
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
-
+    
     - name: Build Rust project (release)
       run: |
         set -euo pipefail
         cargo build --release
-
+    
     - name: Run scanner and choose best (produce scan.log & bestproxy)
       id: scan
       run: |
         set -euo pipefail
         BIN="./target/release/RScanner"
         chmod +x "$BIN" || true
-
         : > scan.log
         if ! $BIN 2>&1 | tee -a scan.log; then
           echo "WARN: scanner failed; attempting partial parse / using cache."
         fi
-
         BEST=""
         BEST_LAT=""
-
-        # prefer explicit file if scanner wrote it
         if [ -f bestproxy.txt ]; then
           BEST="$(tr -d ' \r\n' < bestproxy.txt || true)"
         fi
-
-        # parse scan.log for "PROXY LIVE" + latency if needed
         if [ -z "$BEST" ]; then
           awk '
             BEGIN{IGNORECASE=1}
@@ -80,7 +73,6 @@ jobs:
               print latency, ip
             }
           ' scan.log | sort -n -k1,1 > candidates.txt || true
-
           if [ -s candidates.txt ]; then
             BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
             BEST=$(awk 'NR==1{print $2}' candidates.txt)
@@ -89,27 +81,16 @@ jobs:
             echo "No candidates parsed from scan.log"
           fi
         fi
-
-        # fallback to cache file
         if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
           BEST="$(tr -d ' \r\n' < ${CACHE_FILE} || true)"
           echo "Using cached BEST: $BEST"
         fi
-
         if [ -z "${BEST:-}" ]; then
           echo "ERROR: No best candidate found"
           sed -n '1,200p' scan.log || true
           exit 1
         fi
-
-        # Normalize/clean
-        if [ "${ONLY_IP}" = "true" ]; then
-          BEST_CLEAN="$(echo "$BEST" | sed -E 's/^\[//; s/\](:[0-9]+)?$//; s/:([0-9]+)$//')"
-        else
-          BEST_CLEAN="$(echo "$BEST" | sed -E 's/^\[//; s/\]$//')"
-        fi
-
-        # basic reachability (non-fatal)
+        BEST_CLEAN="$(echo "$BEST" | sed -E 's/^\[//; s/\](:[0-9]+)?$//; s/:([0-9]+)$//')"
         HOST_ONLY="$(echo "$BEST" | sed -E 's/^\[//; s/\](:[0-9]+)?$//; s/:([0-9]+)$//')"
         PORT_PART="$(echo "$BEST" | awk -F: '{ if (NF>1) print $NF; else print "" }')"
         if [ -n "$PORT_PART" ] && command -v nc >/dev/null 2>&1; then
@@ -127,20 +108,18 @@ jobs:
             fi
           fi
         fi
-
-        # persist & outputs
         echo "$BEST" > ${CACHE_FILE}
         echo "bestip=$BEST_CLEAN" >> "$GITHUB_OUTPUT"
         echo "raw_best=$BEST" >> "$GITHUB_OUTPUT"
         echo "best_latency=${BEST_LAT:-}" >> "$GITHUB_OUTPUT"
         echo "Scanner result: $BEST (clean: $BEST_CLEAN)"
-
+    
     - name: Upload scan.log for debug (artifact)
       uses: actions/upload-artifact@v4
       with:
         name: scan-log
         path: scan.log
-
+    
     - name: Commit & push cache/report if changed
       run: |
         set -euo pipefail
@@ -149,34 +128,31 @@ jobs:
         git add ${CACHE_FILE} || true
         if ! git diff --cached --quiet; then
           git commit -m "Proxy update at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" || true
-          # push using GITHUB_TOKEN; if protected branches block it, see notes below
           git push origin HEAD:${GITHUB_REF#refs/heads/} || true
         else
           echo "No changes to commit"
         fi
-
+    
     - name: Update Cloudflare Pages env var (securely from secrets)
       env:
         CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
-        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
-        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
-        CFVAR:       ${{ secrets.CF_VAR_NAME }}
-        BESTIP:      ${{ steps.scan.outputs.bestip }}
+        CFTOKEN: ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT: ${{ secrets.CF_PROJECT_NAME }}
+        CFVAR: ${{ secrets.CF_VAR_NAME }}
+        BESTIP: ${{ steps.scan.outputs.bestip }}
       run: |
         set -euo pipefail
         if [ -z "${BESTIP:-}" ]; then
           echo "ERROR: BESTIP empty; aborting Cloudflare update."
           exit 1
         fi
-        if [ -z "${CFACCOUNTID:-}" ] || [ -z "${CFTOKEN:-}" ] || [ -z "${CFPROJECT:-}" ] || [ -z "${CFVAR:-}" ]; then
+        if [ -z "${CFACCOUNTID:-}" ]  [ -z "${CFTOKEN:-}" ]  [ -z "${CFPROJECT:-}" ] || [ -z "${CFVAR:-}" ]; then
           echo "ERROR: missing required CF secrets"
           exit 1
         fi
-
         url="https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}"
         payload=$(jq -n --arg name "$CFPROJECT" --arg varname "$CFVAR" --arg val "$BESTIP" \
           '{name:$name, env_vars: { ($varname): {value:$val, type:"plaintext"} } }')
-
         echo "PATCH $url -> set ${CFVAR}=${BESTIP}"
         for i in 1 2 3 4 5; do
           resp=$(curl -sS -X PATCH "$url" \
@@ -198,13 +174,13 @@ jobs:
           fi
           sleep $((2**i))
         done
-
+    
     - name: Trigger Cloudflare Pages deploy (optional)
       if: ${{ success() }}
       env:
         CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
-        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
-        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
+        CFTOKEN: ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT: ${{ secrets.CF_PROJECT_NAME }}
       run: |
         set -euo pipefail
         url="https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}/deployments"
@@ -215,14 +191,14 @@ jobs:
           fi
           sleep $((2**i))
         done
-
+    
     - name: Cleanup old deployments (keep last N)
       if: ${{ success() }}
       env:
         CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
-        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
-        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
-        KEEP:        ${{ env.KEEP_DEPLOYMENTS }}
+        CFTOKEN: ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT: ${{ secrets.CF_PROJECT_NAME }}
+        KEEP: ${{ env.KEEP_DEPLOYMENTS }}
       run: |
         set -euo pipefail
         KEEP_NUM=${KEEP:-5}
@@ -243,6 +219,6 @@ jobs:
           echo "Deleting deployment $id"
           curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}/deployments/${id}" -H "Authorization: Bearer ${CFTOKEN}" || true
         done
-
+    
     - name: Done
       run: echo "Workflow complete"
