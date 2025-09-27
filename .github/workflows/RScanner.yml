@@ -5,7 +5,7 @@ name: Rust Proxy Scanner (Ultimate)
 on:
   workflow_dispatch:  # Allows manual triggering
   schedule:
-    - cron: '0 */1 * * *'  # Runs automatically every hour
+    - cron: '0 * * * *'  # Runs automatically every hour
 
 # Ensures only one instance of this workflow runs at a time
 concurrency:
@@ -14,7 +14,7 @@ concurrency:
 
 # Environment variables available to all jobs
 env:
-  KEEP_DEPLOYMENTS: '5' # Number of recent deployments to keep
+  KEEP_DEPLOYMENTS: '1' # Number of recent deployments to keep
   CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
 
 jobs:
