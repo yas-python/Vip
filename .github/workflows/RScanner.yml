@@ -1,198 +1,248 @@
-name: Rust Proxy Scanner
+name: Rust Proxy Scanner (Ultimate)
 
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 00:00 UTC
-    - cron: '0 0 * * *'
+    - cron: '0 */1 * * *'  # every hour
+
+concurrency:
+  group: rust-proxy-scan
+  cancel-in-progress: true
+
+env:
+  KEEP_DEPLOYMENTS: '5'
+  ONLY_IP: 'true'
+  CACHE_FILE: .cachelastbestip.txt
 
 jobs:
   update-proxies:
     runs-on: ubuntu-latest
-    name: Scan, pick best IP, update Cloudflare, redeploy, cleanup
-
-    env:
-      # Cloudflare Pages project name (exactly as in the dashboard)
-      CF_PROJECT_NAME: zizfin
-      # Variable name to store the proxy IP in Cloudflare Pages → Variables and Secrets
-      CF_VAR_NAME: PROXYIP
-      # Number of recent deployments to keep
-      KEEP_DEPLOYMENTS: '5'
+    timeout-minutes: 30
+    outputs:
+      bestip: ${{ steps.scan.outputs.bestip }}
+      raw_best: ${{ steps.scan.outputs.raw_best }}
+      best_latency: ${{ steps.scan.outputs.best_latency }}
 
     steps:
-    - name: Checkout repository
+    - name: Checkout repo
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
 
+    - name: Setup environment (install tools & Python deps)
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y jq curl ca-certificates python3 python3-pip netcat-openbsd
+        python3 -m pip install --no-cache-dir requests
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
     - name: Build Rust project (release)
-      run: cargo build --release
-
-    - name: Ensure jq is available
-      run: sudo apt-get update && sudo apt-get install -y jq
-
-    - name: Run scanner and extract best IP
-      id: scan
-      shell: bash
       run: |
         set -euo pipefail
+        cargo build --release
 
+    - name: Run scanner and choose best (produce scan.log & bestproxy)
+      id: scan
+      run: |
+        set -euo pipefail
         BIN="./target/release/RScanner"
-        chmod +x "$BIN"
+        chmod +x "$BIN" || true
 
-        # Run the scanner and save output
-        # Assumption: Scanner prints a line like:
-        # Best Proxy IP: 104.21.2.205:443
-        # If format differs, adjust the grep patterns accordingly.
-        "$BIN" 2>&1 | tee scan.log || true
-
-        # If a report file exists, we can commit later
-        if [ -f sub/ProxyIP-Daily.md ]; then
-          echo "Scanner updated: sub/ProxyIP-Daily.md"
+        : > scan.log
+        if ! $BIN 2>&1 | tee -a scan.log; then
+          echo "WARN: scanner failed; attempting partial parse / using cache."
         fi
 
-        # Try to find the best IP line
-        BEST_LINE="$(grep -Eio 'best (proxy )?ip[^:]*:\s*[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?' scan.log | tail -n1 || true)"
-        if [ -z "${BEST_LINE}" ]; then
-          # Fallback: match common lines like
-          # [VVV] 104.248.63.17:30588 (0.18 sec)
-          BEST_LINE="$(grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?\s*\([0-9.]+\s*sec\)' scan.log | sort -hk2 | head -n1 || true)"
+        BEST=""
+        BEST_LAT=""
+
+        # prefer explicit file if scanner wrote it
+        if [ -f bestproxy.txt ]; then
+          BEST="$(tr -d ' \r\n' < bestproxy.txt || true)"
         fi
 
-        if [ -z "${BEST_LINE}" ]; then
-          echo "ERROR: Could not parse best IP from scanner output."
-          echo "---- scanner output (first 200 lines) ----"
+        # parse scan.log for "PROXY LIVE" + latency if needed
+        if [ -z "$BEST" ]; then
+          awk '
+            BEGIN{IGNORECASE=1}
+            /PROXY[[:space:]]+LIVE/ {
+              line=$0
+              if (match(line, /([0-9]+)[[:space:]]*ms/, lat)) { latency=lat[1] }
+              else if (match(line, /\(([0-9]+)[[:space:]]*ms\)/, lat)) { latency=lat[1] }
+              else next
+              if (match(line, /(\[[0-9a-fA-F:]+\](:[0-9]{1,5})?)/, addr)) { ip=addr[1] }
+              else if (match(line, /([0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{1,5})?)/, addr)) { ip=addr[1] }
+              else next
+              print latency, ip
+            }
+          ' scan.log | sort -n -k1,1 > candidates.txt || true
+
+          if [ -s candidates.txt ]; then
+            BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
+            BEST=$(awk 'NR==1{print $2}' candidates.txt)
+            echo "Selected candidate from log: $BEST (lat ${BEST_LAT} ms)"
+          else
+            echo "No candidates parsed from scan.log"
+          fi
+        fi
+
+        # fallback to cache file
+        if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
+          BEST="$(tr -d ' \r\n' < ${CACHE_FILE} || true)"
+          echo "Using cached BEST: $BEST"
+        fi
+
+        if [ -z "${BEST:-}" ]; then
+          echo "ERROR: No best candidate found"
           sed -n '1,200p' scan.log || true
           exit 1
         fi
 
-        # Extract IP[:PORT]
-        BEST_IP="$(echo "$BEST_LINE" | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?' | head -n1)"
-
-        # Validate IP
-        if ! echo "$BEST_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]{2,5})?$'; then
-          echo "ERROR: Parsed BEST_IP is invalid: '$BEST_IP'"
-          exit 1
+        # Normalize/clean
+        if [ "${ONLY_IP}" = "true" ]; then
+          BEST_CLEAN="$(echo "$BEST" | sed -E 's/^\[//; s/\](:[0-9]+)?$//; s/:([0-9]+)$//')"
+        else
+          BEST_CLEAN="$(echo "$BEST" | sed -E 's/^\[//; s/\]$//')"
         fi
 
-        echo "Best IP found: $BEST_IP"
-        echo "best_ip=$BEST_IP" >> "$GITHUB_OUTPUT"
+        # basic reachability (non-fatal)
+        HOST_ONLY="$(echo "$BEST" | sed -E 's/^\[//; s/\](:[0-9]+)?$//; s/:([0-9]+)$//')"
+        PORT_PART="$(echo "$BEST" | awk -F: '{ if (NF>1) print $NF; else print "" }')"
+        if [ -n "$PORT_PART" ] && command -v nc >/dev/null 2>&1; then
+          if nc -z -w 2 "$HOST_ONLY" "$PORT_PART" >/dev/null 2>&1; then
+            echo "TCP port reachable"
+          else
+            echo "WARN: TCP port not reachable (continuing anyway)"
+          fi
+        else
+          if command -v ping >/dev/null 2>&1; then
+            if ping -c 1 -W 1 "$HOST_ONLY" >/dev/null 2>&1; then
+              echo "ICMP reachable"
+            else
+              echo "WARN: ICMP not reachable (continuing anyway)"
+            fi
+          fi
+        fi
 
-    - name: Commit and push IP report if changed
-      if: ${{ success() }}
-      shell: bash
+        # persist & outputs
+        echo "$BEST" > ${CACHE_FILE}
+        echo "bestip=$BEST_CLEAN" >> "$GITHUB_OUTPUT"
+        echo "raw_best=$BEST" >> "$GITHUB_OUTPUT"
+        echo "best_latency=${BEST_LAT:-}" >> "$GITHUB_OUTPUT"
+        echo "Scanner result: $BEST (clean: $BEST_CLEAN)"
+
+    - name: Upload scan.log for debug (artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: scan-log
+        path: scan.log
+
+    - name: Commit & push cache/report if changed
       run: |
         set -euo pipefail
         git config --global user.name "NET Sentinel Bot"
         git config --global user.email "224584266+NetSentinel-Bot@users.noreply.github.com"
-        if git ls-files --error-unmatch sub/ProxyIP-Daily.md >/dev/null 2>&1; then
-          git add sub/ProxyIP-Daily.md
-          git diff --cached --quiet || git commit -m "Proxy IPs test completion at: $(TZ='Asia/Tehran' date '+%H:%M:%S')"
-          git push origin main
+        git add ${CACHE_FILE} || true
+        if ! git diff --cached --quiet; then
+          git commit -m "Proxy update at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" || true
+          # push using GITHUB_TOKEN; if protected branches block it, see notes below
+          git push origin HEAD:${GITHUB_REF#refs/heads/} || true
         else
-          echo "No ProxyIP-Daily.md to commit."
+          echo "No changes to commit"
         fi
 
-    - name: Update Cloudflare Pages variable (PROXYIP)
-      id: cf-var
-      shell: bash
+    - name: Update Cloudflare Pages env var (securely from secrets)
       env:
-        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
+        CFVAR:       ${{ secrets.CF_VAR_NAME }}
+        BESTIP:      ${{ steps.scan.outputs.bestip }}
       run: |
         set -euo pipefail
-        BEST_IP="${{ steps.scan.outputs.best_ip }}"
-        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
-        CF_VAR="${{ env.CF_VAR_NAME }}"
-
-        # Update project env var (persistent in Settings → Variables and Secrets)
-        PAYLOAD="$(jq -n --arg name "$CF_PROJECT" \
-                        --arg var "$CF_VAR" \
-                        --arg val "$BEST_IP" \
-                        '{name: $name, env_vars: {($var): {value: $val, type: "plain_text"}}}')"
-
-        curl -sS -X PATCH "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data "${PAYLOAD}" | tee cf_update_var.json
-
-        if ! jq -e '.success == true' cf_update_var.json >/dev/null; then
-          echo "ERROR: Cloudflare variable update failed"
-          jq '.errors // empty' cf_update_var.json || true
+        if [ -z "${BESTIP:-}" ]; then
+          echo "ERROR: BESTIP empty; aborting Cloudflare update."
+          exit 1
+        fi
+        if [ -z "${CFACCOUNTID:-}" ] || [ -z "${CFTOKEN:-}" ] || [ -z "${CFPROJECT:-}" ] || [ -z "${CFVAR:-}" ]; then
+          echo "ERROR: missing required CF secrets"
           exit 1
         fi
 
-        echo "Cloudflare variable ${CF_VAR} updated to ${BEST_IP}"
+        url="https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}"
+        payload=$(jq -n --arg name "$CFPROJECT" --arg varname "$CFVAR" --arg val "$BESTIP" \
+          '{name:$name, env_vars: { ($varname): {value:$val, type:"plaintext"} } }')
 
-    - name: Trigger redeploy
-      id: cf-deploy
-      shell: bash
+        echo "PATCH $url -> set ${CFVAR}=${BESTIP}"
+        for i in 1 2 3 4 5; do
+          resp=$(curl -sS -X PATCH "$url" \
+            -H "Authorization: Bearer ${CFTOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$payload" || true)
+          if [ -n "$resp" ]; then
+            ok=$(echo "$resp" | jq -r '.success // false')
+            if [ "$ok" = "true" ]; then
+              echo "Cloudflare variable updated successfully."
+              echo "$resp" | jq .
+              break
+            else
+              echo "Attempt $i: CF API returned non-success. Body:"
+              echo "$resp" | jq -C .
+            fi
+          else
+            echo "Attempt $i: empty response"
+          fi
+          sleep $((2**i))
+        done
+
+    - name: Trigger Cloudflare Pages deploy (optional)
+      if: ${{ success() }}
       env:
-        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
       run: |
         set -euo pipefail
-        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
-
-        # Create a new deployment (Pages → Deployments)
-        curl -sS -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" \
-          -H "Content-Type: application/json" \
-          --data '{}' | tee cf_new_deploy.json
-
-        if ! jq -e '.success == true' cf_new_deploy.json >/dev/null; then
-          echo "ERROR: Cloudflare deployment trigger failed"
-          jq '.errors // empty' cf_new_deploy.json || true
-          exit 1
-        fi
-
-        DEPLOY_ID="$(jq -r '.result.id' cf_new_deploy.json)"
-        echo "deploy_id=${DEPLOY_ID}" >> "$GITHUB_OUTPUT"
-        echo "Triggered new deployment: ${DEPLOY_ID}"
+        url="https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}/deployments"
+        for i in 1 2 3 4 5; do
+          resp=$(curl -sS -X POST "$url" -H "Authorization: Bearer ${CFTOKEN}" -H "Content-Type: application/json" --data "{}" || true)
+          if [ -n "$resp" ] && [ "$(echo "$resp" | jq -r '.success // false')" = "true" ]; then
+            echo "Triggered deployment"; break
+          fi
+          sleep $((2**i))
+        done
 
     - name: Cleanup old deployments (keep last N)
       if: ${{ success() }}
-      shell: bash
       env:
-        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFACCOUNTID: ${{ secrets.CF_ACCOUNT_ID }}
+        CFTOKEN:     ${{ secrets.CF_API_TOKEN }}
+        CFPROJECT:   ${{ secrets.CF_PROJECT_NAME }}
+        KEEP:        ${{ env.KEEP_DEPLOYMENTS }}
       run: |
         set -euo pipefail
-        CF_PROJECT="${{ env.CF_PROJECT_NAME }}"
-        KEEP="${{ env.KEEP_DEPLOYMENTS }}"
-
-        # List latest deployments
-        curl -sS -G "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" \
-          --data-urlencode "per_page=50" \
-          | tee cf_list_deploys.json
-
-        if ! jq -e '.success == true' cf_list_deploys.json >/dev/null; then
-          echo "WARN: Could not list deployments; skipping cleanup."
-          exit 0
+        KEEP_NUM=${KEEP:-5}
+        url="https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}/deployments"
+        resp=$(curl -sS -G -H "Authorization: Bearer ${CFTOKEN}" "$url" --data-urlencode "per_page=50" || true)
+        if [ -z "$resp" ]; then
+          echo "WARN: empty list deployments response; skipping cleanup"; exit 0
         fi
-
-        # Newest → oldest
-        IDS=( $(jq -r '.result | sort_by(.created_on) | reverse | .[].id' cf_list_deploys.json) )
-        COUNT="${#IDS[@]}"
-        echo "Found ${COUNT} deployments"
-
-        if [ "$COUNT" -le "$KEEP" ]; then
-          echo "No cleanup needed (<= ${KEEP})"
-          exit 0
+        if [ "$(echo "$resp" | jq -r '.success // false')" != "true" ]; then
+          echo "WARN: list deployments failed; skipping cleanup"; exit 0
         fi
-
-        # Delete extras from the end
-        for ((i=KEEP; i<COUNT; i++)); do
-          ID="${IDS[$i]}"
-          echo "Deleting old deployment: ${ID}"
-          curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/deployments/${ID}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -o /dev/null || echo "WARN: delete failed for ${ID}"
+        mapfile -t ids < <(echo "$resp" | jq -r '.result | sort_by(.created_on) | reverse | .[].id')
+        total=${#ids[@]}
+        echo "Found $total deployments, keeping $KEEP_NUM"
+        if [ "$total" -le "$KEEP_NUM" ]; then echo "No cleanup needed"; exit 0; fi
+        for idx in $(seq ${KEEP_NUM} $((total-1))); do
+          id=${ids[$idx]}
+          echo "Deleting deployment $id"
+          curl -sS -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CFACCOUNTID}/pages/projects/${CFPROJECT}/deployments/${id}" -H "Authorization: Bearer ${CFTOKEN}" || true
         done
 
-        echo "Cleanup complete."
+    - name: Done
+      run: echo "Workflow complete"
