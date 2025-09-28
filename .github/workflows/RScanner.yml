@@ -1,83 +1,72 @@
 # ======================================================================
-#  Rust Proxy Scanner (Ultimate & Optimized Edition)
+#  Rust Proxy Scanner (Ultimate & Professional CI/CD)
 #  Engineered for maximum speed, intelligence, and reliability.
-#  This version includes professional CI checks and a more robust build process.
+#  This workflow verifies, builds, scans, deploys, and cleans up.
 # ======================================================================
 name: Rust Proxy Scanner (Professional CI/CD)
 
 # ----------------------------------------------------------------------
 #  TRIGGERS
-#  Defines when the workflow runs automatically or manually.
+#  Defines when the workflow runs.
 # ----------------------------------------------------------------------
 on:
-  workflow_dispatch:  # Allows manual triggering from the Actions tab
+  workflow_dispatch:  # Allows manual triggering
   schedule:
-    - cron: '0 * * * *'  # Runs automatically at the start of every hour
+    - cron: '0 * * * *'  # Runs automatically every hour
 
 # ----------------------------------------------------------------------
-#  CONCURRENCY CONTROL
-#  Ensures only one instance runs at a time to prevent conflicts.
+#  CONCURRENCY & PERMISSIONS
 # ----------------------------------------------------------------------
 concurrency:
   group: rust-proxy-scan
   cancel-in-progress: true
 
-# ----------------------------------------------------------------------
-#  SECURITY PERMISSIONS
-#  Restricts permissions for the GITHUB_TOKEN for enhanced security.
-# ----------------------------------------------------------------------
 permissions:
-  contents: write  # Needed to commit the cache file
-  actions: write   # Needed to delete old workflow runs
+  contents: write  # To commit the cache file
+  actions: write   # To delete old workflow runs
 
 # ----------------------------------------------------------------------
 #  ENVIRONMENT VARIABLES
-#  Global variables available to all jobs.
 # ----------------------------------------------------------------------
 env:
-  KEEP_DEPLOYMENTS: '1' # Number of recent Cloudflare deployments to keep
-  CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
-  RUST_VERSION: stable # Defines the Rust toolchain version
+  KEEP_DEPLOYMENTS: '1'
+  CACHE_FILE: .cachelastbestip.txt
+  RUST_VERSION: stable
 
 # ======================================================================
 #  JOBS
-#  The sequence of tasks to be executed.
 # ======================================================================
 jobs:
   # --------------------------------------------------------------------
   #  JOB 1: BUILD & VERIFY
-  #  Verifies code quality, then compiles the Rust application efficiently.
+  #  Verifies code quality, then compiles the application.
   # --------------------------------------------------------------------
   build_and_verify:
     name: ⚙️ Compile & Verify Scanner
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # Increased timeout for extra steps
+    timeout-minutes: 15
     
     steps:
     - name: ⬇️ Checkout repository code
       uses: actions/checkout@v4
 
-    - name: 🦀 Install Rust toolchain
+    - name: 🦀 Install Rust toolchain with components
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ env.RUST_VERSION }}
-        components: clippy, rustfmt # Install clippy and rustfmt for quality checks
+        components: clippy, rustfmt
 
     - name: 🧠 Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
 
-    # INTELLIGENT UPGRADE: Check formatting to ensure consistent code style.
-    - name: 🎨 Check Code Formatting
+    - name: 🎨 Check Code Formatting (Quality Gate)
       run: cargo fmt --all -- --check
 
-    # INTELLIGENT UPGRADE: Run Clippy linter to catch common mistakes and improve code quality.
-    - name: 🔬 Lint Code with Clippy
+    - name: 🔬 Lint Code with Clippy (Quality Gate)
       run: cargo clippy --all-targets -- -D warnings
       
-    # FIX & AUTOMATION: Build the project. Removed '--locked' to allow Cargo to
-    # automatically update the lock file if needed, preventing common CI failures.
     - name: 🛠️ Build Rust project for release
       run: cargo build --release
 
@@ -88,14 +77,13 @@ jobs:
         path: target/release/RScanner
 
   # --------------------------------------------------------------------
-  #  JOB 2: SCAN & UPDATE
-  #  Runs the scanner, updates Cloudflare, and commits the result.
-  #  This job only runs after the 'build_and_verify' job succeeds.
+  #  JOB 2: SCAN, UPDATE & DEPLOY
+  #  Runs the scanner, updates Cloudflare, and deploys.
   # --------------------------------------------------------------------
   scan_and_update:
     name: 📡 Scan, Update & Deploy
     runs-on: ubuntu-latest
-    needs: build_and_verify # Depends on the build and verify job
+    needs: build_and_verify
     timeout-minutes: 30
 
     steps:
@@ -115,8 +103,6 @@ jobs:
       run: |
         set -euo pipefail
         echo "::group::🚀 Starting proxy scan..."
-        # PROFESSIONAL UPGRADE: Run the scanner but don't let a crash stop the script immediately.
-        # This allows us to still parse the log for any partial results.
         set +e
         ./RScanner 2>&1 | tee scan.log
         SCANNER_EXIT_CODE=${PIPESTATUS[0]}
@@ -128,9 +114,7 @@ jobs:
         echo "::endgroup::"
         
         echo "::group::🔍 Analyzing scan results..."
-        # This awk command robustly finds the IP with the lowest latency from the log.
-        # It looks for lines with "PROXY LIVE", extracts latency in "ms", and finds the IP address.
-        awk '
+        BEST_IP=$(awk '
           BEGIN{IGNORECASE=1; best_lat=99999; best_ip=""}
           /PROXY[[:space:]]+LIVE/ && match($0, /\(([0-9]+)[[:space:]]*ms\)/, lat) && match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, addr) {
             if (lat[1] < best_lat) {
@@ -138,33 +122,23 @@ jobs:
               best_ip = addr[1]
             }
           }
-          END{
-            if (best_ip != "") {
-              print best_ip
-            }
-          }
-        ' scan.log > best_ip.txt
+          END{if (best_ip != "") print best_ip}' scan.log)
         echo "::endgroup::"
 
-        BEST_IP=""
-        if [ -s best_ip.txt ]; then
-          BEST_IP=$(cat best_ip.txt)
-          echo "✅ Found best IP from new scan: $BEST_IP"
-        else
-          echo "⚠️ No live proxy found in scan. Falling back to cache."
+        if [ -z "$BEST_IP" ]; then
+          echo "⚠️ No live proxy found in new scan. Falling back to cache."
           if [ -f "${{ env.CACHE_FILE }}" ]; then
             BEST_IP=$(cat "${{ env.CACHE_FILE }}")
             echo "↪️ Using cached IP: $BEST_IP"
+          else
+            echo "❌ CRITICAL: No best IP found from scan or cache. Aborting."
+            exit 1
           fi
+        else
+          echo "✅ Found best IP from new scan: $BEST_IP"
         fi
-
-        if [ -z "$BEST_IP" ]; then
-          echo "❌ CRITICAL: No best IP found from scan or cache. Aborting."
-          exit 1
-        fi
-
-        echo "Selected IP: $BEST_IP"
-        echo "$BEST_IP" > "${{ env.CACHE_FILE }}"
+        
+        echo "$BEST_IP" > ${{ env.CACHE_FILE }}
         echo "bestip=$BEST_IP" >> "$GITHUB_OUTPUT"
 
     - name: 💾 Commit & push cache file
@@ -172,7 +146,6 @@ jobs:
         git config --global user.name "NET Sentinel Bot"
         git config --global user.email "actions@github.com"
         git add ${{ env.CACHE_FILE }}
-        # Commit only if there are changes to the cached IP
         if ! git diff --cached --quiet; then
           git commit -m "🌐 Proxy update: $(date -u)"
           git push
@@ -220,22 +193,21 @@ jobs:
         echo "✅ New deployment triggered on Cloudflare."
 
     - name: 📜 Upload scan log for debugging
-      if: always() # Always upload the log, even if a step fails
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: scan-log
         path: scan.log
 
   # --------------------------------------------------------------------
-  #  JOB 3: CLEANUP
-  #  Cleans up old Cloudflare deployments and old workflow runs.
-  #  Runs in parallel and always executes, even if other jobs fail.
+  #  JOB 3: HOUSEKEEPING
+  #  Cleans up old deployments and workflow runs.
   # --------------------------------------------------------------------
   cleanup:
     name: 🧹 Housekeeping
     runs-on: ubuntu-latest
-    needs: scan_and_update # Ensures it runs after the main logic
-    if: always() # IMPORTANT: This job runs even if previous jobs fail
+    needs: scan_and_update
+    if: always()
     
     steps:
     - name: 🗑️ Delete old workflow runs
@@ -243,8 +215,8 @@ jobs:
       with:
         token: ${{ github.token }}
         repository: ${{ github.repository }}
-        retain_days: 1 # Keep runs from the last day
-        keep_minimum_runs: 5 # Always keep the 5 most recent runs
+        retain_days: 1
+        keep_minimum_runs: 5
 
     - name: ☁️ Cleanup old Cloudflare deployments
       env:
@@ -255,9 +227,6 @@ jobs:
         echo "Fetching list of deployments..."
         DEPLOYMENTS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments" -H "Authorization: Bearer ${CF_API_TOKEN}")
         
-        # This jq command filters and selects old deployments for deletion.
-        # It sorts by creation date (newest first), skips the ones we want to keep,
-        # and then extracts the IDs of the remaining (older) ones.
         IDS_TO_DELETE=$(echo "$DEPLOYMENTS" | jq -r ".result | sort_by(.created_on) | reverse | .[${{ env.KEEP_DEPLOYMENTS }}:] | .[] | .id")
 
         if [ -z "$IDS_TO_DELETE" ]; then
@@ -271,4 +240,3 @@ jobs:
             curl -s -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments/${id}" -H "Authorization: Bearer ${CF_API_TOKEN}"
         done
         echo "✅ Cleanup complete."
-
