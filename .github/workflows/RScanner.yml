@@ -49,10 +49,11 @@ jobs:
         key: rust-proxy-scanner-best-ip-cache
 
     # 4. Install Rust toolchain and cache dependencies for faster builds
-    # Swatinem/rust-cache is the best practice for caching Cargo dependencies.
-    # The "Cache not found" warning is normal on the first run or after changing dependencies.
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      
+    # NOTE: The "Cache not found" warning you see is NORMAL for the first run.
+    # The cache is saved at the end of the job, so the warning will disappear on the next run.
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
@@ -72,13 +73,11 @@ jobs:
         : > scan.log # Clear previous log
 
         echo "🚀 Starting proxy scan..."
-        # Run scanner; if it fails, the 'pipefail' will stop the script unless we manage the error
         $BIN 2>&1 | tee -a scan.log || echo "⚠️ Scanner exited with a non-zero status. Will try to find proxies in partial results."
 
         BEST=""
         BEST_LAT=""
 
-        # Parse the scan log to find live proxies, sort them by latency
         echo "🔍 Analyzing scan results..."
         awk '
           BEGIN{IGNORECASE=1}
@@ -97,26 +96,23 @@ jobs:
           echo "🟡 No live proxies found in the new scan. Checking for a cached IP."
         fi
 
-        # Fallback to the cached IP if the scan finds nothing
         if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
           BEST="$(tr -d ' \r\n' < ${CACHE_FILE})"
           echo "✅ Using cached best IP: $BEST"
         fi
 
-        # If still no IP is found, the workflow must fail
         if [ -z "${BEST:-}" ]; then
           echo "❌ FATAL: No best candidate found from scan or cache. Aborting."
           exit 1
         fi
 
-        # Save the best IP to the cache file for the next run and output it for other steps
         echo "💾 Saving '$BEST' to cache file and GitHub output."
         echo "$BEST" > ${CACHE_FILE}
         echo "bestip=$BEST" >> "$GITHUB_OUTPUT"
 
     # 7. Upload the scan log as an artifact for debugging
     - name: Upload scan.log for debug
-      if: always() # Upload log even if the job fails
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: scan-log-${{ github.run_id }}
@@ -172,9 +168,9 @@ jobs:
         -H "Content-Type: application/json"
         echo "✅ New deployment successfully triggered."
 
-    # 10. ***FIXED*** Clean up old deployments to avoid hitting Cloudflare limits
+    # 10. Clean up old deployments to avoid hitting Cloudflare limits
     - name: Cleanup old deployments
-      if: always() # This step runs even if previous steps fail
+      if: always()
       env:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -185,10 +181,8 @@ jobs:
         echo "🧹 Fetching list of deployments to clean up..."
         API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}"
         
-        # Fetch deployments and handle potential errors
         DEPLOYMENTS_JSON=$(curl -s --fail -X GET "${API_URL}/deployments" -H "Authorization: Bearer ${CF_API_TOKEN}")
         
-        # This jq command safely gets IDs to delete, skipping the most recent 'KEEP' number. It won't fail if the array is empty.
         IDS_TO_DELETE=$(echo "$DEPLOYMENTS_JSON" | jq -r ".result | sort_by(.created_on) | reverse | .[${KEEP}:] | .[]? | .id")
 
         if [ -z "$IDS_TO_DELETE" ]; then
@@ -199,11 +193,9 @@ jobs:
         echo "🗑️ The following old deployment IDs will be deleted:"
         echo "$IDS_TO_DELETE"
         
-        # Loop through each ID and delete it. This is more robust as one failure won't stop the whole script.
         for id in $IDS_TO_DELETE; do
             echo "   - Attempting to delete deployment: $id"
             
-            # The API call now captures the response to check for errors individually.
             RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE "${API_URL}/deployments/${id}" \
               -H "Authorization: Bearer ${CF_API_TOKEN}")
               
@@ -213,7 +205,6 @@ jobs:
             if [ "$HTTP_CODE" -eq 200 ]; then
                 echo "     ✅ Successfully deleted."
             else
-                # We log the error but continue to the next ID
                 echo "     ⚠️ Failed to delete deployment $id. API returned status $HTTP_CODE."
                 echo "     Response Body: $BODY"
             fi
@@ -223,10 +214,10 @@ jobs:
   # JOB 2: Cleanup workflow runs to keep the Actions history clean
   cleanup-runs:
     runs-on: ubuntu-latest
-    needs: update-proxies # Runs only after the main job is finished
-    if: always() # Runs regardless of whether the main job succeeded or failed
+    needs: update-proxies
+    if: always()
     permissions:
-      actions: write # This permission is required for the action to work
+      actions: write
     steps:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
