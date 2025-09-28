@@ -1,7 +1,5 @@
 # ######################################################################
 # name: Rust Proxy Scanner (Definitive Edition)
-# Author: Gemini AI
-# Last Updated: 2025-09-28
 # ######################################################################
 name: Rust Proxy Scanner (Definitive Edition)
 
@@ -71,8 +69,7 @@ jobs:
 
     # 5. Build the scanner program
     #
-    # IMPORTANT: The '--locked' flag is a best practice for CI. It ensures that the build
-    # uses the EXACT versions from Cargo.lock. If this step fails, it means your
+    # IMPORTANT: The '--locked' flag is a best practice for CI. If this step fails, it means your
     # Cargo.toml and Cargo.lock are out of sync. To fix it, run 'cargo update' locally,
     # then commit and push the updated 'Cargo.lock' file to your repository.
     #
