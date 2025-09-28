@@ -16,7 +16,7 @@ concurrency:
 env:
   # --- Configuration ---
   CARGO_TERM_COLOR: always
-  KEEP_DEPLOYMENTS: '2' # Number of recent deployments to keep (2 is safer: current + previous)
+  KEEP_DEPLOYMENTS: '1' # Number of recent deployments to keep (2 is safer: current + previous)
   CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
   RUST_CACHE_KEY: v1 # Increment this to manually invalidate the Rust cache
 
@@ -224,5 +224,5 @@ jobs:
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_days: 1
-          keep_minimum_runs: 5
+          retain_days: 0
+          keep_minimum_runs: 0
