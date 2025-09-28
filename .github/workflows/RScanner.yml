@@ -211,9 +211,14 @@ jobs:
   # --------------------------------------------------------------------------------
   # JOB 2: Cleanup workflow runs to keep the Actions history clean
   # --------------------------------------------------------------------------------
-  jobs:
-  run-script:
+  cleanup-runs:
     runs-on: ubuntu-latest
+    needs: update-proxies # Runs only after the main job is finished
+    if: always() # Runs regardless of whether the main job succeeded or failed
+
+    # --- Security Best Practice: This job needs permission to delete workflow runs ---
+    permissions:
+      actions: write
 
     steps:
       - name: Step 1 - Delete Workflow Runs
