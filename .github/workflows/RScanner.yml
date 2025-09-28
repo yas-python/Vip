@@ -14,10 +14,9 @@ concurrency:
 
 # Environment variables available to all jobs
 env:
-  # --- Configuration ---
   CARGO_TERM_COLOR: always
-  KEEP_DEPLOYMENTS: '1' # Number of recent deployments to keep
-  CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
+  KEEP_DEPLOYMENTS: '1'
+  CACHE_FILE: .cachelastbestip.txt
 
 jobs:
   # This job finds the best proxy and updates Cloudflare
@@ -39,7 +38,7 @@ jobs:
         sudo apt-get install -y jq curl python3 python3-pip netcat-openbsd
         python3 -m pip install --no-cache-dir requests
 
-    # 3. [IMPROVEMENT] Restore best IP from cache instead of git
+    # 3. Restore best IP from cache instead of git
     - name: Restore best IP cache
       uses: actions/cache@v4
       id: ip-cache-restore
@@ -47,7 +46,7 @@ jobs:
         path: ${{ env.CACHE_FILE }}
         key: rust-proxy-scanner-best-ip-cache
 
-    # 4. [IMPROVEMENT] Install Rust toolchain and cache dependencies for speed
+    # 4. Install Rust toolchain and cache dependencies for speed
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
     - name: Cache Rust dependencies
@@ -57,26 +56,18 @@ jobs:
     - name: Build Rust project
       run: cargo build --release
 
-    # 6. Run the scanner and find the best IP with the lowest latency
+    # 6. Run the scanner and choose best IP
     - name: Run scanner and choose best IP
       id: scan
       run: |
-        set -euo pipefail # Exit on any error
+        set -euo pipefail
         BIN="./target/release/RScanner"
         chmod +x "$BIN"
-        : > scan.log # Clear previous log
-
-        # Run scanner and log output
+        : > scan.log
         if ! $BIN 2>&1 | tee -a scan.log; then
           echo "WARN: Scanner failed; attempting to parse partial results or use cache."
         fi
-
         BEST=""
-        BEST_LAT=""
-
-        # Try to find the best IP from the fresh scan log
-        # This pipeline finds lines with 'PROXY LIVE', extracts latency and IP,
-        # sorts by latency (lowest first), and stores them.
         awk '
           BEGIN{IGNORECASE=1}
           /PROXY[[:space:]]+LIVE/ {
@@ -85,7 +76,6 @@ jobs:
             print latency, ip
           }
         ' scan.log | sort -n -k1,1 > candidates.txt || true
-
         if [ -s candidates.txt ]; then
           BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
           BEST=$(awk 'NR==1{print $2}' candidates.txt)
@@ -93,36 +83,30 @@ jobs:
         else
           echo "⚠️ No live proxies found in the new scan. Checking cache."
         fi
-
-        # If no IP was found from the scan, fall back to the cached IP
         if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
           BEST="$(tr -d ' \r\n' < ${CACHE_FILE} || true)"
           echo "✅ Using cached BEST IP: $BEST"
         fi
-
-        # If still no IP after checking the scan and cache, fail the workflow
         if [ -z "${BEST:-}" ]; then
           echo "❌ ERROR: No best candidate found from scan or cache. Aborting."
           exit 1
         fi
-
-        # Save the best IP to the cache file for the next run and output it for subsequent steps
         echo "💾 Saving $BEST to cache file for next run."
         echo "$BEST" > ${CACHE_FILE}
         echo "bestip=$BEST" >> "$GITHUB_OUTPUT"
         echo "Scanner result: $BEST"
 
-    # 7. [IMPROVEMENT] Save the updated cache file for the next workflow run
+    # 7. Save the updated cache file for the next workflow run
     - name: Save best IP cache
       uses: actions/cache/save@v4
-      if: ${{ steps.ip-cache-restore.outputs.cache-hit != 'true' || always() }}
+      if: always()
       with:
         path: ${{ env.CACHE_FILE }}
         key: rust-proxy-scanner-best-ip-cache
 
-    # 8. Upload the scan log as an artifact for debugging
+    # 8. Upload the scan log for debugging
     - name: Upload scan.log for debug
-      if: always() # Upload log even if later steps fail
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: scan-log-${{ github.run_id }}
@@ -142,40 +126,24 @@ jobs:
           echo "❌ ERROR: BESTIP is empty; aborting Cloudflare update."
           exit 1
         fi
-
         API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}"
-
-        # This JSON payload correctly targets the 'production' environment variables
         JSON_PAYLOAD=$(jq -n \
           --arg var_name "$CF_VAR_NAME" \
           --arg var_value "$BESTIP" \
           '{deployment_configs: {production: {env_vars: {($var_name): {value: $var_value}}}}}')
-
-        echo "📡 Sending PATCH request to Cloudflare API to update variable..."
-
-        # Make the API call and capture the response and HTTP code
+        echo "📡 Sending PATCH request to Cloudflare API..."
         RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH "$API_URL" \
           -H "Authorization: Bearer ${CF_API_TOKEN}" \
           -H "Content-Type: application/json" \
           --data "$JSON_PAYLOAD")
-
         HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
         BODY=$(echo "$RESPONSE" | sed '$d')
-
-        # Error handling for the API call
-        if [ "$HTTP_CODE" -ne 200 ]; then
-          echo "❌ Error: Cloudflare API returned HTTP status $HTTP_CODE"
-          echo "Response Body: $BODY"
+        if [ "$HTTP_CODE" -ne 200 ] || [ "$(echo "$BODY" | jq -r '.success')" != "true" ]; then
+          echo "❌ Error: Cloudflare API returned failure."
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response Body: $BODY" | jq .
           exit 1
         fi
-
-        SUCCESS=$(echo "$BODY" | jq -r '.success')
-        if [ "$SUCCESS" != "true" ]; then
-            echo "❌ Error: Cloudflare API reported failure."
-            echo "Response Body: $BODY" | jq .
-            exit 1
-        fi
-
         echo "✅ Cloudflare variable '${CF_VAR_NAME}' updated successfully to '${BESTIP}'."
 
     # 10. Trigger a new deployment in Cloudflare Pages
@@ -188,13 +156,13 @@ jobs:
       run: |
         echo "🚀 Triggering a new deployment..."
         curl --fail -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments" \
-        -H "Authorization: Bearer ${CF_API_TOKEN}" \
-        -H "Content-Type: application/json"
+        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json"
         echo "✅ New deployment triggered."
 
-    # 11. Clean up old deployments to avoid hitting Cloudflare limits
+    # 11. [FIXED & IMPROVED] Clean up old deployments
     - name: Cleanup old deployments
-      if: always() # This step runs even if previous steps fail
+      if: always()
+      continue-on-error: true # This prevents the whole workflow from failing if cleanup fails.
       env:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -203,37 +171,29 @@ jobs:
       run: |
         echo "🧹 Fetching list of deployments to clean up..."
         DEPLOYMENTS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments" -H "Authorization: Bearer ${CF_API_TOKEN}")
-
-        # Get IDs of all deployments except for the most recent 'KEEP' number
         IDS_TO_DELETE=$(echo "$DEPLOYMENTS" | jq -r ".result | sort_by(.created_on) | reverse | .[${KEEP}:] | .[] | .id")
-
         if [ -z "$IDS_TO_DELETE" ]; then
             echo "👍 No old deployments to delete."
             exit 0
         fi
-
         for id in $IDS_TO_DELETE; do
             echo "🗑️ Deleting old deployment: $id"
             curl --fail -s -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments/${id}" -H "Authorization: Bearer ${CF_API_TOKEN}"
         done
         echo "✅ Cleanup complete."
 
-  # --------------------------------------------------------------------------------
-  # JOB 2: Cleanup workflow runs to keep the Actions history clean
-  # --------------------------------------------------------------------------------
+  # Job 2: Cleanup workflow runs to keep the Actions history clean
   cleanup-runs:
     runs-on: ubuntu-latest
-    needs: update-proxies # Runs only after the main job is finished
-    if: always() # Runs regardless of whether the main job succeeded or failed
-
+    needs: update-proxies
+    if: always()
     permissions:
       actions: write
-
     steps:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 0
+          retain_days: 1
+          keep_minimum_runs: 5
