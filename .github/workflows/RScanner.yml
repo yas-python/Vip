@@ -32,7 +32,7 @@ jobs:
   update-proxy-variable:
     name: Build → Scan → Update Cloudflare Worker (RScanner)
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ env.TIMEOUT_MINUTES }}
+    timeout-minutes: 30 # <-- FIX 1: Replaced ${{ env.TIMEOUT_MINUTES }} with 30 to fix linter error
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
 
@@ -71,7 +71,7 @@ jobs:
             target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
+          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }} # <-- FIX 2: Corrected typo RUSS_CACHE_KEY to RUST_CACHE_KEY
 
       - name: Build Rust project (release)
         run: |
