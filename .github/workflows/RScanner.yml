@@ -32,7 +32,7 @@ jobs:
   update-proxy-variable:
     name: Build → Scan → Update Cloudflare Worker (RScanner)
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # <-- FIX 1: Replaced ${{ env.TIMEOUT_MINUTES }} with 30 to fix linter error
+    timeout-minutes: 30
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
 
@@ -58,11 +58,11 @@ jobs:
           key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
 
       - name: Install Rust toolchain (stable)
-        uses: actions-rs/toolchain@v1
+        # FIX: Replaced deprecated actions-rs/toolchain@v1 with dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
           toolchain: stable
-          override: true
+          profile: minimal
 
       - name: Cache Rust artifacts & registry
         uses: actions/cache@v4
@@ -71,7 +71,7 @@ jobs:
             target
             ~/.cargo/registry
             ~/.cargo/git
-          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }} # <-- FIX 2: Corrected typo RUSS_CACHE_KEY to RUST_CACHE_KEY
+          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
 
       - name: Build Rust project (release)
         run: |
@@ -239,13 +239,18 @@ jobs:
           # Extract vars and secrets safely
           VARS_JSON=$(echo "$body" | jq -r '.result.settings.vars // {}' 2>/dev/null || echo "{}")
           SECRETS_JSON=$(echo "$body" | jq -r '.result.settings.secrets // {}' 2>/dev/null || echo "{}")
-
+          
+          # 💡 IMPORTANT FIX/LOGIC REFINEMENT:
+          # Assuming CF_VAR_NAME (which is 'PROXYIP') is a Plaintext Variable,
+          # we ONLY update it in VARS_JSON and preserve all secrets.
           echo "✅ Current vars retrieved. Preparing updated payload."
-          # Use jq to update the specific variable, preserving all others
+          
+          # Use jq to update the specific Variable ($CF_VAR_NAME), preserving all others
           UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value' 2>/dev/null || echo "{}")
-          # Construct the final payload for the PUT request
+          
+          # Construct the final payload for the PUT request (VARS and original SECRETS)
           FINAL_PAYLOAD=$(jq -n --argjson vars "$UPDATED_VARS" --argjson secrets "$SECRETS_JSON" '{ "vars": $vars, "secrets": $secrets }')
-
+          
           echo "📡 Sending PUT to update service settings (PUT ${PUT_API_URL}) with retries..."
           if ! put_body=$(retry_request "PUT" "${PUT_API_URL}" "$FINAL_PAYLOAD"); then
             echo "❌ Cloudflare PUT failed after retries. Check token scopes (workers.services:edit) and service name."
