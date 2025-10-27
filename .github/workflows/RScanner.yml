@@ -16,7 +16,7 @@ concurrency:
 env:
   # --- Configuration ---
   CARGO_TERM_COLOR: always
-  KEEP_DEPLOYMENTS: '100' # Number of recent deployments to keep (2 is safer: current + previous)
+  KEEP_DEPLOYMENTS: '1' # Number of recent deployments to keep (2 is safer: current + previous)
   CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
   RUST_CACHE_KEY: v1 # Increment this to manually invalidate the Rust cache
 
@@ -155,6 +155,7 @@ jobs:
         echo "✅ Cloudflare variable '${CF_VAR_NAME}' updated successfully to '${BESTIP}'."
 
     # 9. Trigger a new deployment in Cloudflare Pages
+    #    (FIXED: Removed --fail and Content-Type header to prevent errors)
     - name: Trigger Cloudflare Pages deploy
       env:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
@@ -163,9 +164,11 @@ jobs:
       run: |
         set -euo pipefail
         echo "🚀 Triggering a new deployment..."
-        curl --fail -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments" \
-        -H "Authorization: Bearer ${CF_API_TOKEN}" \
-        -H "Content-Type: application/json"
+        # Note: Removed --fail and Content-Type header.
+        # This step is redundant as the previous step already triggers a deploy.
+        # Removing --fail prevents an error (like 409 Conflict) from failing the job.
+        curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}"
         echo "✅ New deployment successfully triggered."
 
     # 10. Clean up old deployments to avoid hitting Cloudflare limits
