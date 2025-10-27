@@ -1,5 +1,5 @@
 # 1. FIX: Added name tag to display 'RScanner' in the Actions list instead of the file path.
-name: RScanner
+name: Rust Proxy Scanner (Ultimate)
 
 # Triggers: manual + hourly schedule
 on:
