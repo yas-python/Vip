@@ -6,7 +6,7 @@ on:
   schedule:
     - cron: '0 * * * *' # Runs automatically every hour
 
-# Ensures only one instance of this workflow runs at a time
+# Ensures only one instance of this workflow runs at a time (Concurrency Control)
 concurrency:
   group: rust-proxy-scan-final-plaintext
   cancel-in-progress: true
@@ -18,7 +18,7 @@ env:
   CACHE_FILE: .cachelastbestip.txt 
   RUST_CACHE_KEY: v4 # Increment this to manually invalidate the Rust cache
   TIMEOUT_MINUTES: 30
-  CF_ENVIRONMENT: production # <--- Set your Worker Service Environment here (usually 'production')
+  CF_ENVIRONMENT: production # Worker Service Environment (Based on your setup)
 
 jobs:
   # JOB 1: Finds the best proxy and updates Cloudflare Plaintext Variable
@@ -33,7 +33,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 2. Setup environment
+      # 2. Setup environment (Essential tools only)
       - name: Setup environment
         run: |
           echo "Installing essential tools (jq, curl, netcat)..."
@@ -77,6 +77,7 @@ jobs:
           : > scan.log
 
           echo "🚀 Starting proxy scan..."
+          # The '|| echo' prevents the entire step from failing if the scanner only finds partial results
           "$BIN" 2>&1 | tee -a scan.log || echo "⚠️ Scanner exited non-zero. Searching for partial results."
 
           BEST=""
@@ -130,20 +131,20 @@ jobs:
           name: scan-log-${{ github.run_id }}
           path: scan.log
 
-      # 8. Update the Plaintext Variable in Cloudflare Worker Service (Intelligent Logic)
+      # 8. Update the Plaintext Variable in Cloudflare Worker Service (The Core Fix)
       - name: Update Cloudflare Worker Variable
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }} # Service Name (e.g., solitary-recipe-4d9dhh)
-          CF_VAR_NAME: ${{ secrets.CF_VAR_NAME }}     # Variable Name (e.g., PROXYIP)
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }} 
+          CF_VAR_NAME: ${{ secrets.CF_VAR_NAME }}     
           BESTIP: ${{ steps.scan.outputs.bestip }}
           CF_ENVIRONMENT: ${{ env.CF_ENVIRONMENT }}
         run: |
           set -euo pipefail
           
           echo "🔐 Validating all required secrets..."
-          # These checks ensure no critical variable is empty, preventing HTTP 400 (Code 10003)
+          # These robust checks prevent HTTP 400 (Code 10003) errors if secrets are empty
           if [ -z "${BESTIP:-}" ]; then echo "❌ ERROR: BESTIP is empty." ; exit 1 ; fi
           if [ -z "${CF_ACCOUNT_ID:-}" ]; then echo "❌ ERROR: CF_ACCOUNT_ID is not set." ; exit 1 ; fi
           if [ -z "${CF_API_TOKEN:-}" ]; then echo "❌ ERROR: CF_API_TOKEN is not set/empty. Check permissions." ; exit 1 ; fi
@@ -169,7 +170,7 @@ jobs:
             exit 1
           fi
 
-          # Extract the existing variables (vars) and secrets to preserve them
+          # Extract the existing variables (vars) and secrets to preserve them (e.g., ADMIN_KEY)
           VARS_JSON=$(echo "$RESPONSE" | jq '.result.settings.vars')
           SECRETS_JSON=$(echo "$RESPONSE" | jq '.result.settings.secrets')
           
@@ -183,7 +184,6 @@ jobs:
           UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value')
 
           # 2. Build the FINAL PUT payload: Must include BOTH updated vars and existing secrets
-          # This prevents deletion of other variables/secrets like ADMIN_KEY or ROOT_PROXY_URL
           FINAL_PAYLOAD=$(jq -n \
             --argjson vars "$UPDATED_VARS" \
             --argjson secrets "$SECRETS_JSON" \
