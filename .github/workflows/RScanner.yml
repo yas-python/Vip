@@ -142,10 +142,11 @@ jobs:
         API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/secrets"
         
         # Build the JSON Payload for the PUT request
+        # ❗️ ***FIXED HERE***: Payload is now correctly wrapped in an array [ ... ]
         JSON_PAYLOAD=$(jq -n \
           --arg var_name "$CF_VAR_NAME" \
           --arg var_value "$BESTIP" \
-          '{name: $var_name, text: $var_value}')
+          '[{name: $var_name, text: $var_value}]')
 
         echo "📡 Sending PUT request to Cloudflare API to update secret..."
         
