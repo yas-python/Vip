@@ -30,7 +30,7 @@ jobs:
   update-proxy-variable:
     name: Build → Scan → Update Cloudflare Worker (Debug)
     runs-on: ubuntu-latest
-    # FIX: Set static timeout to resolve 'Unrecognized named-value: 'env'' error (Line 35, Col 22).
+    # FIX: Set static timeout to resolve 'Unrecognized named-value: 'env'' error.
     timeout-minutes: 30
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
@@ -186,12 +186,10 @@ jobs:
 
           echo "DEBUG: CF_WORKER_NAME is set to: ${CF_WORKER_NAME}"
           echo "DEBUG: CF_VAR_NAME is set to: ${CF_VAR_NAME}"
-          echo "DEBUG: BESTIP is set to: ${BESTIP}"
           
           GET_API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/services/${CF_WORKER_NAME}/environments/${CF_ENVIRONMENT}"
           PUT_API_URL="${GET_API_URL}/settings"
           echo "DEBUG: Target GET URL: ${GET_API_URL}"
-          echo "DEBUG: Target PUT URL: ${PUT_API_URL}"
 
           # Helper: retry HTTP request with advanced logging (using -v)
           retry_request() {
@@ -213,13 +211,11 @@ jobs:
                 response=$(curl -s -v -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" 2>&1 | tee "$log_file") || response=""
               fi
 
-              # Extract HTTP code (last line of output) and body
+              # Extract HTTP code (last line of output)
               http_code=$(tail -n1 "$log_file" | tail -c 4)
-              body_and_code=$(tail -n2 "$log_file") # Get last two lines for body/code analysis
               
               if [[ "$http_code" =~ ^[0-9]{3}$ ]] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
                 echo "→ HTTP $http_code success."
-                # Extract clean response body (JSON)
                 local json_body=$(grep -o '{.*}' "$log_file" || true)
                 echo "$json_body"
                 return 0
