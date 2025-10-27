@@ -1,4 +1,4 @@
-name: Rust Proxy Scanner (Final & Smart Debug)
+name: Rust Proxy Scanner (Ultimate)
 
 # Triggers: manual + hourly schedule
 on:
@@ -8,10 +8,10 @@ on:
 
 # Ensure only one scan runs at a time
 concurrency:
-  group: rust-proxy-scan-final-debug
+  group: rust-proxy-scan-final-plaintext
   cancel-in-progress: true
 
-# Permissions: actions:write is needed for the cleanup step.
+# Minimal repo permissions required (we need actions:write to delete runs)
 permissions:
   contents: read
   actions: write
@@ -28,9 +28,9 @@ env:
 
 jobs:
   update-proxy-variable:
-    name: Build → Scan → Update Cloudflare Worker (Debug)
+    name: Build → Scan → Update Cloudflare Worker (RScanner)
     runs-on: ubuntu-latest
-    # FIX: Set static timeout to resolve 'Unrecognized named-value: 'env'' error (Line 35, Col 22).
+    # FIX: Set static timeout to resolve 'Unrecognized named-value: 'env'' error
     timeout-minutes: 30
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
@@ -57,7 +57,7 @@ jobs:
           key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
 
       - name: Install Rust toolchain (stable)
-        # FIX: Replaced deprecated actions-rs/toolchain@v1 to eliminate 'set-output' warnings.
+        # FIX: Replaced deprecated actions-rs/toolchain@v1 to eliminate 'set-output' warnings
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -105,7 +105,6 @@ jobs:
           "$BIN" 2>&1 | tee -a "$LOG" || echo "⚠️ Scanner exited with non-zero status; continue to parse log."
 
           echo "🔍 Parsing scan.log for 'PROXY ... LIVE' lines with latency and IPv4"
-          # Robust awk script to find best IP and latency
           awk '
             BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
@@ -176,7 +175,7 @@ jobs:
           set -euo pipefail
           echo "=== Cloudflare update step start ==="
 
-          # Validate required inputs (Fail-fast if secrets are missing)
+          # Validate required inputs
           : "${BESTIP:?BESTIP is required from scanner step}"
           : "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID secret is required}"
           : "${CF_API_TOKEN:?CF_API_TOKEN secret is required}"
@@ -184,16 +183,9 @@ jobs:
           : "${CF_VAR_NAME:?CF_VAR_NAME secret is required}"
           : "${CF_ENVIRONMENT:?CF_ENVIRONMENT is required (env)}"
 
-          echo "DEBUG: CF_WORKER_NAME is set to: ${CF_WORKER_NAME}"
-          echo "DEBUG: CF_VAR_NAME is set to: ${CF_VAR_NAME}"
-          echo "DEBUG: BESTIP is set to: ${BESTIP}"
-          
           GET_API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/services/${CF_WORKER_NAME}/environments/${CF_ENVIRONMENT}"
           PUT_API_URL="${GET_API_URL}/settings"
-          echo "DEBUG: Target GET URL: ${GET_API_URL}"
-          echo "DEBUG: Target PUT URL: ${PUT_API_URL}"
 
-          # Helper: retry HTTP request with advanced logging (using -v)
           retry_request() {
             local method="$1"
             local url="$2"
@@ -201,33 +193,23 @@ jobs:
             local attempt=1
             local max="${MAX_RETRIES:-5}"
             local base_sleep="${BASE_SLEEP:-2}"
-            local log_file="curl_output_${method}.log"
-
             while [ "$attempt" -le "$max" ]; do
               echo "→ Attempt #$attempt: ${method} ${url}"
-              
-              # Execute curl with -v (verbose) to capture detailed headers/response
               if [ -z "$data" ]; then
-                response=$(curl -s -v -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" 2>&1 | tee "$log_file") || response=""
+                response=$(curl -s -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" ) || response=""
               else
-                response=$(curl -s -v -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" 2>&1 | tee "$log_file") || response=""
+                response=$(curl -s -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" ) || response=""
               fi
+              http_code=$(echo "$response" | tail -n1)
+              body=$(echo "$response" | sed '$d' || true)
 
-              # Extract HTTP code (last line of output) and body
-              http_code=$(tail -n1 "$log_file" | tail -c 4)
-              body_and_code=$(tail -n2 "$log_file") # Get last two lines for body/code analysis
-              
-              if [[ "$http_code" =~ ^[0-9]{3}$ ]] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+              if [ -n "$http_code" ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
                 echo "→ HTTP $http_code success."
-                # Extract clean response body (JSON)
-                local json_body=$(grep -o '{.*}' "$log_file" || true)
-                echo "$json_body"
+                echo "$body"
                 return 0
               else
-                echo "⚠️ HTTP $http_code (attempt $attempt). Request failed."
-                echo "❌ Cloudflare API Full Response (for Debugging - Check for error codes/messages):"
-                cat "$log_file" || true # Print the full log for analysis
-                
+                echo "⚠️ HTTP $http_code (attempt $attempt). Response body (truncated):"
+                echo "$body" | sed -n '1,200p' || true
                 if [ "$attempt" -lt "$max" ]; then
                   sleep_seconds=$(( base_sleep ** attempt ))
                   echo "⏳ Sleeping ${sleep_seconds}s before retry..."
@@ -242,7 +224,7 @@ jobs:
 
           echo "📡 Fetching current service settings (GET ${GET_API_URL}) with retries..."
           if ! body=$(retry_request "GET" "${GET_API_URL}"); then
-            echo "❌ Cloudflare GET failed. This usually means the Account ID, Worker Name, or Token is incorrect/unauthorized."
+            echo "❌ Cloudflare GET failed after retries. Ensure CF_API_TOKEN has workers.services:read scopes."
             exit 1
           fi
 
@@ -250,27 +232,22 @@ jobs:
           VARS_JSON=$(echo "$body" | jq -r '.result.settings.vars // {}' 2>/dev/null || echo "{}")
           SECRETS_JSON=$(echo "$body" | jq -r '.result.settings.secrets // {}' 2>/dev/null || echo "{}")
 
+          # Update the Plaintext Variable (CF_VAR_NAME) in VARS_JSON
           echo "✅ Current vars retrieved. Preparing updated payload."
 
-          # Use jq to update the specific Plaintext Variable ($CF_VAR_NAME), preserving all others
           UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value' 2>/dev/null || echo "{}")
 
           # Construct the final payload for the PUT request (UPDATED VARS and original SECRETS)
           FINAL_PAYLOAD=$(jq -n --argjson vars "$UPDATED_VARS" --argjson secrets "$SECRETS_JSON" '{ "vars": $vars, "secrets": $secrets }')
-          
-          echo "DEBUG: Final PUT Payload (Truncated):"
-          echo "$FINAL_PAYLOAD" | head -n 20 || true
-          
+
           echo "📡 Sending PUT to update service settings (PUT ${PUT_API_URL}) with retries..."
           if ! put_body=$(retry_request "PUT" "${PUT_API_URL}" "$FINAL_PAYLOAD"); then
-            echo "❌ Cloudflare PUT failed. **ACTION REQUIRED: Check the full response above for the specific error message from Cloudflare.**"
+            echo "❌ Cloudflare PUT failed after retries. Check token scopes (workers.services:edit) and service name."
             exit 1
           fi
 
           echo "✅ Cloudflare Worker Variable '${CF_VAR_NAME}' updated successfully."
           echo "=== Cloudflare update step end ==="
-
-  ---
 
   cleanup-runs:
     name: Cleanup old workflow runs
