@@ -1,4 +1,4 @@
-name: Rust Proxy Scanner for Workers (Ultimate/Final - Plaintext Var)
+name: RScanner
 
 # Triggers: manual + hourly schedule
 on:
@@ -21,17 +21,24 @@ env:
   RUST_CACHE_KEY: v4
   TIMEOUT_MINUTES: 30
   CF_ENVIRONMENT: production
+  SCAN_BINARY: ./target/release/RScanner
+  SCAN_LOG: scan.log
+  MAX_CF_RETRIES: "5"
+  CF_RETRY_BASE_SLEEP: "2"
 
 jobs:
   update-proxy-variable:
+    name: Build → Scan → Update Cloudflare Worker (RScanner)
     runs-on: ubuntu-latest
     timeout-minutes: ${{ env.TIMEOUT_MINUTES }}
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (full)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install system deps (jq, curl, build tools, libssl)
         run: |
@@ -67,30 +74,39 @@ jobs:
       - name: Build Rust project (release)
         run: |
           set -euo pipefail
-          echo "=> cargo build --release"
-          cargo build --release
+          echo "=> cargo build --release (start)"
+          if ! cargo build --release 2>&1 | tee build-output.log; then
+            echo "❌ cargo build failed. Showing last 200 lines from build-output.log"
+            tail -n 200 build-output.log || true
+            exit 1
+          fi
+          echo "✅ cargo build completed."
+          echo "Contents of target/release:"
+          ls -la target/release || true
 
       - name: Run scanner and choose best IP
         id: scan
         run: |
           set -euo pipefail
-          BIN="./target/release/RScanner"
-          LOG="scan.log"
+          echo "=== Scanner step start ==="
+          BIN="${{ env.SCAN_BINARY }}"
+          LOG="${{ env.SCAN_LOG }}"
           : > "$LOG"
 
+          echo "→ Checking scanner binary at $BIN"
           if [ ! -f "$BIN" ]; then
             echo "❌ FATAL: Scanner executable not found at $BIN"
-            echo "Contents of target/release:"
+            echo "Listing build dir:"
             ls -la ./target/release || true
             exit 1
           fi
 
           chmod +x "$BIN" || true
-          echo "🚀 Starting scanner..."
-          # Allow scanner to exit non-zero but capture output
-          "$BIN" 2>&1 | tee -a "$LOG" || echo "⚠️ Scanner exited non-zero; continuing to parse output."
+          echo "🚀 Running scanner (output → $LOG). Scanner may exit non-zero; we will still attempt to parse results."
+          # Keep scanner output even if it exits non-zero
+          "$BIN" 2>&1 | tee -a "$LOG" || echo "⚠️ Scanner exited with non-zero status; continue to parse log."
 
-          echo "🔍 Parsing results for lines like 'PROXY ... LIVE' with latency and IPv4..."
+          echo "🔍 Parsing scan.log for 'PROXY ... LIVE' lines with latency and IPv4"
           awk '
             BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
@@ -108,12 +124,13 @@ jobs:
             BEST=$(awk 'NR==1{print $2}' candidates.txt)
             echo "✅ Selected best candidate from scan: $BEST (latency ${BEST_LAT} ms)"
           else
-            echo "🟡 No live proxies parsed from $LOG. Will attempt cache fallback."
+            echo "🟡 No live proxies parsed from $LOG. Attempting cache fallback..."
           fi
 
           # Fallback: cached file
           if [ -z "${BEST:-}" ] && [ -f "${CACHE_FILE}" ]; then
             CAND=$(tr -d ' \r\n' < ${CACHE_FILE} || true)
+            echo "🔁 Found cache value: '$CAND'"
             if [[ "$CAND" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
               BEST="$CAND"
               echo "✅ Using cached IP: $BEST"
@@ -123,24 +140,27 @@ jobs:
           fi
 
           if [ -z "${BEST:-}" ]; then
-            echo "❌ FATAL: No best IP found from scan or cache. Aborting with error."
+            echo "❌ FATAL: No best IP found from scan or cache. Dumping last 200 lines of $LOG for debugging:"
+            tail -n 200 "$LOG" || true
             exit 1
           fi
 
-          echo "💾 Saving best IP to cache file."
-          echo "$BEST" > ${CACHE_FILE}
+          echo "💾 Persisting best IP to cache file (${CACHE_FILE})"
+          echo "$BEST" > ${CACHE_FILE} || true
 
-          # set GitHub Actions output
+          # export output correctly for GitHub Actions
           echo "bestip=${BEST}" >> "$GITHUB_OUTPUT"
+          echo "✅ Scanner step complete. bestip=${BEST}"
+          echo "=== Scanner step end ==="
 
       - name: Upload scan.log for debugging (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scan-log-${{ github.run_id }}
-          path: scan.log
+          path: ${{ env.SCAN_LOG }}
 
-      - name: Update Cloudflare Worker Variable (service vars)
+      - name: Update Cloudflare Worker Variable (service vars) with retries
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -148,10 +168,13 @@ jobs:
           CF_VAR_NAME: ${{ secrets.CF_VAR_NAME }}
           BESTIP: ${{ steps.scan.outputs.bestip }}
           CF_ENVIRONMENT: ${{ env.CF_ENVIRONMENT }}
+          MAX_RETRIES: ${{ env.MAX_CF_RETRIES }}
+          BASE_SLEEP: ${{ env.CF_RETRY_BASE_SLEEP }}
         run: |
           set -euo pipefail
+          echo "=== Cloudflare update step start ==="
 
-          echo "🔐 Validating inputs and secrets..."
+          # Validate required inputs
           : "${BESTIP:?BESTIP is required from scanner step}"
           : "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID secret is required}"
           : "${CF_API_TOKEN:?CF_API_TOKEN secret is required}"
@@ -162,43 +185,68 @@ jobs:
           GET_API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/services/${CF_WORKER_NAME}/environments/${CF_ENVIRONMENT}"
           PUT_API_URL="${GET_API_URL}/settings"
 
-          echo "📡 Fetching current service settings..."
-          RESPONSE=$(curl -s -X GET "$GET_API_URL" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json")
+          # Helper: retry HTTP request with exponential backoff
+          retry_request() {
+            local method="$1"
+            local url="$2"
+            local data="${3:-}"
+            local attempt=1
+            local max="${MAX_RETRIES:-5}"
+            local base_sleep="${BASE_SLEEP:-2}"
+            while [ "$attempt" -le "$max" ]; do
+              echo "→ Attempt #$attempt: ${method} ${url}"
+              if [ -z "$data" ]; then
+                response=$(curl -s -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" ) || response=""
+              else
+                response=$(curl -s -w "\n%{http_code}" -X "$method" "$url" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" ) || response=""
+              fi
+              http_code=$(echo "$response" | tail -n1)
+              body=$(echo "$response" | sed '$d' || true)
 
-          if ! echo "$RESPONSE" | jq -e '.success == true' > /dev/null; then
-            echo "❌ Cloudflare GET failed. Full response:"
-            echo "$RESPONSE"
-            echo "💡 Hint: Verify CF_ACCOUNT_ID and CF_WORKER_NAME (service name) and that CF_API_TOKEN has workers.services:edit scope."
+              if [ -n "$http_code" ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+                echo "→ HTTP $http_code success."
+                echo "$body"
+                return 0
+              else
+                echo "⚠️ HTTP $http_code (attempt $attempt). Response body (truncated):"
+                echo "$body" | sed -n '1,200p' || true
+                if [ "$attempt" -lt "$max" ]; then
+                  sleep_seconds=$(( base_sleep ** attempt ))
+                  echo "⏳ Sleeping ${sleep_seconds}s before retry..."
+                  sleep $sleep_seconds
+                fi
+              fi
+              attempt=$((attempt+1))
+            done
+            echo "❌ All $max attempts failed for ${method} ${url}"
+            return 1
+          }
+
+          echo "📡 Fetching current service settings (GET ${GET_API_URL}) with retries..."
+          if ! body=$(retry_request "GET" "${GET_API_URL}"); then
+            echo "❌ Cloudflare GET failed after retries. Ensure CF_ACCOUNT_ID, CF_WORKER_NAME are correct and CF_API_TOKEN has workers.services:read/edit scopes."
             exit 1
           fi
 
-          VARS_JSON=$(echo "$RESPONSE" | jq '.result.settings.vars // {}')
-          SECRETS_JSON=$(echo "$RESPONSE" | jq '.result.settings.secrets // {}')
+          # Extract vars and secrets safely
+          VARS_JSON=$(echo "$body" | jq -r '.result.settings.vars // {}' 2>/dev/null || echo "{}")
+          SECRETS_JSON=$(echo "$body" | jq -r '.result.settings.secrets // {}' 2>/dev/null || echo "{}")
 
-          echo "✅ Preparing updated vars payload (inserting ${CF_VAR_NAME}=${BESTIP})..."
-          UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value')
-
+          echo "✅ Current vars retrieved. Preparing updated payload."
+          UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value' 2>/dev/null || echo "{}")
           FINAL_PAYLOAD=$(jq -n --argjson vars "$UPDATED_VARS" --argjson secrets "$SECRETS_JSON" '{ "vars": $vars, "secrets": $secrets }')
 
-          echo "📡 Sending PUT to update service settings..."
-          PUT_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "$PUT_API_URL" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            --data "$FINAL_PAYLOAD")
-
-          HTTP_CODE=$(echo "$PUT_RESPONSE" | tail -n1)
-          BODY=$(echo "$PUT_RESPONSE" | sed '$d')
-
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "❌ Cloudflare API Error (HTTP: $HTTP_CODE). Body:"
-            echo "$BODY"
-            echo "💡 Ensure CF_API_TOKEN has 'workers.services:edit' scope and CF_WORKER_NAME is exact service name (check Cloudflare dashboard)."
+          echo "📡 Sending PUT to update service settings (PUT ${PUT_API_URL}) with retries..."
+          if ! put_body=$(retry_request "PUT" "${PUT_API_URL}" "$FINAL_PAYLOAD"); then
+            echo "❌ Cloudflare PUT failed after retries. Check token scopes (workers.services:edit) and service name. Full attempted payload:"
+            echo "$FINAL_PAYLOAD" | sed -n '1,200p' || true
             exit 1
           fi
 
           echo "✅ Cloudflare Worker Variable '${CF_VAR_NAME}' updated successfully in '${CF_ENVIRONMENT}'."
+          echo "Cloudflare PUT response (truncated):"
+          echo "$put_body" | sed -n '1,200p' || true
+          echo "=== Cloudflare update step end ==="
 
   cleanup-runs:
     name: Cleanup old workflow runs
