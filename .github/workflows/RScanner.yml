@@ -1,25 +1,19 @@
-# .github/workflows/RScanner.yml
-# Name: Rust Proxy Scanner for Workers (Ultimate/Final - Plaintext Var)
-
 name: Rust Proxy Scanner for Workers (Ultimate/Final - Plaintext Var)
 
-# Triggers for the workflow
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *' # Runs every hour
+    - cron: '0 * * * *' # every hour
 
-# Ensure only one instance runs at a time
 concurrency:
   group: rust-proxy-scan-final-plaintext
   cancel-in-progress: true
 
-# Fine-grained permissions required by steps (keep minimal & explicit)
+# Keep minimal permissions but include actions write because we delete runs later
 permissions:
   contents: read
   actions: write
 
-# Environment variables available to all jobs
 env:
   CARGO_TERM_COLOR: always
   CACHE_FILE: .cachelastbestip.txt
@@ -28,7 +22,6 @@ env:
   CF_ENVIRONMENT: production
 
 jobs:
-  # JOB 1: Finds the best proxy and updates Cloudflare Plaintext Variable
   update-proxy-variable:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ env.TIMEOUT_MINUTES }}
@@ -42,27 +35,33 @@ jobs:
       - name: Setup environment (jq, curl, netcat)
         run: |
           set -euo pipefail
-          echo "Installing essential packages..."
           sudo apt-get update -y
-          sudo apt-get install -y jq curl netcat-openbsd
+          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev
 
-      - name: Manage Best IP Cache (restore)
+      - name: Restore Best IP Cache
         uses: actions/cache@v4
         id: ip-cache
         with:
           path: ${{ env.CACHE_FILE }}
-          # Keep a stable key; bump RUST_CACHE_KEY to invalidate manually
-          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}
+          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - name: Install Rust toolchain (stable)
+        uses: actions-rs/toolchain@v1
         with:
-          key: ${{ env.RUST_CACHE_KEY }}
+          profile: minimal
+          toolchain: stable
+          override: true
 
-      - name: Build Rust project
+      - name: Cache Rust dependencies (target, registry)
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
+
+      - name: Build Rust project (release)
         run: |
           set -euo pipefail
           cargo build --release
@@ -73,72 +72,66 @@ jobs:
           set -euo pipefail
           BIN="./target/release/RScanner"
 
-          if [ ! -f "$BIN" ]; then
-            echo "❌ FATAL: Scanner executable not found ($BIN). Build likely failed."
+          if [ ! -x "$BIN" ]; then
+            echo "❌ FATAL: Scanner executable not found at $BIN"
+            ls -la ./target/release || true
             exit 1
           fi
 
-          chmod +x "$BIN"
           : > scan.log
-
           echo "🚀 Starting proxy scan..."
-          # Run scanner and capture all output; do not fail whole step on non-zero exit (we handle)
-          "$BIN" 2>&1 | tee -a scan.log || echo "⚠️ Scanner exited non-zero; continuing to parse results."
+          # run scanner; allow non-zero exit but capture output
+          "$BIN" 2>&1 | tee -a scan.log || echo "⚠️ Scanner exited with non-zero code; parsing what we have."
 
-          BEST=""
-          BEST_LAT=""
-
-          echo "🔍 Analyzing scan results..."
-          # Extract lines that indicate live proxies and their latency + IPv4
+          echo "🔍 Parsing scan.log for live proxies and latencies..."
           awk '
             BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
               if (match($0, /([0-9]+)[[:space:]]*ms/, lat)) { latency=lat[1] } else next
-              if (match($0, /([0-9]{1,3}(\\.[0-9]{1,3}){3})/ , addr)) { ip=addr[1] } else next
+              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/ , addr)) { ip=addr[1] } else next
               print latency, ip
             }
           ' scan.log | sort -n -k1,1 > candidates.txt || true
+
+          BEST=""
+          BEST_LAT=""
 
           if [ -s candidates.txt ]; then
             BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
             BEST=$(awk 'NR==1{print $2}' candidates.txt)
             echo "✅ Selected best candidate: $BEST (latency: ${BEST_LAT} ms)"
           else
-            echo "🟡 No live proxies found in scan.log. Will attempt to use cache."
+            echo "🟡 No live proxies parsed from scan.log. Will try cache fallback."
           fi
 
-          # Fallback to cached IP if scanner found nothing
+          # Fallback to cached IP
           if [ -z "${BEST:-}" ] && [ -f "${CACHE_FILE}" ]; then
-            BEST="$(tr -d ' \r\n' < ${CACHE_FILE})" || BEST=""
-            # Validate IPv4 (basic)
-            if ! [[ "$BEST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-                echo "❌ Cached IP '$BEST' is invalid. Ignoring cache."
-                BEST=""
+            CAND=$(tr -d ' \r\n' < ${CACHE_FILE} || true)
+            if [[ "$CAND" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+              BEST="$CAND"
+              echo "✅ Using cached IP: $BEST"
             else
-                echo "✅ Using cached IP: $BEST"
+              echo "❌ Cached value invalid or empty: '$CAND'"
             fi
           fi
 
           if [ -z "${BEST:-}" ]; then
             echo "❌ FATAL: No best IP found from scan or cache. Aborting job."
-            # attach scan.log via artifact step below (upload will still run via if: always())
+            # leave scan.log for artifact upload (next step runs always)
             exit 1
           fi
 
-          echo "💾 Saving '$BEST' to cache file."
           echo "$BEST" > ${CACHE_FILE}
+          echo "bestip=${BEST}" >> "$GITHUB_OUTPUT"
 
-          # Set GitHub output
-          echo "bestip=$BEST" >> "$GITHUB_OUTPUT"
-
-      - name: Upload scan.log for debug
+      - name: Upload scan.log for debugging
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scan-log-${{ github.run_id }}
           path: scan.log
 
-      - name: Update Cloudflare Worker Variable
+      - name: Update Cloudflare Worker Variable (service vars)
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -149,13 +142,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "🔐 Validating required inputs and secrets..."
-          if [ -z "${BESTIP:-}" ]; then echo "❌ ERROR: BESTIP is empty." ; exit 1 ; fi
-          if [ -z "${CF_ACCOUNT_ID:-}" ]; then echo "❌ ERROR: CF_ACCOUNT_ID is not set." ; exit 1 ; fi
-          if [ -z "${CF_API_TOKEN:-}" ]; then echo "❌ ERROR: CF_API_TOKEN is not set or empty. Ensure token has workers.api:edit permission." ; exit 1 ; fi
-          if [ -z "${CF_WORKER_NAME:-}" ]; then echo "❌ ERROR: CF_WORKER_NAME is empty." ; exit 1 ; fi
-          if [ -z "${CF_VAR_NAME:-}" ]; then echo "❌ ERROR: CF_VAR_NAME is empty." ; exit 1 ; fi
-          if [ -z "${CF_ENVIRONMENT:-}" ]; then echo "❌ ERROR: CF_ENVIRONMENT is empty." ; exit 1 ; fi
+          echo "🔐 Validating required inputs..."
+          : "${BESTIP:?BESTIP is required (from previous step)}"
+          : "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID is required}"
+          : "${CF_API_TOKEN:?CF_API_TOKEN is required}"
+          : "${CF_WORKER_NAME:?CF_WORKER_NAME is required}"
+          : "${CF_VAR_NAME:?CF_VAR_NAME is required}"
+          : "${CF_ENVIRONMENT:?CF_ENVIRONMENT is required}"
 
           GET_API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/services/${CF_WORKER_NAME}/environments/${CF_ENVIRONMENT}"
           PUT_API_URL="${GET_API_URL}/settings"
@@ -165,27 +158,18 @@ jobs:
             -H "Authorization: Bearer ${CF_API_TOKEN}" \
             -H "Content-Type: application/json")
 
-          # Detect common Cloudflare GET errors
-          if echo "$RESPONSE" | jq -e '.success != true' > /dev/null; then
+          if ! echo "$RESPONSE" | jq -e '.success == true' > /dev/null; then
             echo "❌ Cloudflare GET failed. Response:"
             echo "$RESPONSE"
             exit 1
           fi
 
-          VARS_JSON=$(echo "$RESPONSE" | jq '.result.settings.vars')
-          SECRETS_JSON=$(echo "$RESPONSE" | jq '.result.settings.secrets')
-
-          if [ "$VARS_JSON" = "null" ]; then VARS_JSON="{}" ; fi
-          if [ "$SECRETS_JSON" = "null" ]; then SECRETS_JSON="{}" ; fi
-
-          echo "✅ Existing configuration retrieved. Preparing updated payload..."
+          VARS_JSON=$(echo "$RESPONSE" | jq '.result.settings.vars // {}')
+          SECRETS_JSON=$(echo "$RESPONSE" | jq '.result.settings.secrets // {}')
 
           UPDATED_VARS=$(echo "$VARS_JSON" | jq --arg name "$CF_VAR_NAME" --arg value "$BESTIP" '. | .[$name] = $value')
 
-          FINAL_PAYLOAD=$(jq -n \
-            --argjson vars "$UPDATED_VARS" \
-            --argjson secrets "$SECRETS_JSON" \
-            '{ "vars": $vars, "secrets": $secrets }')
+          FINAL_PAYLOAD=$(jq -n --argjson vars "$UPDATED_VARS" --argjson secrets "$SECRETS_JSON" '{ "vars": $vars, "secrets": $secrets }')
 
           echo "📡 Sending PUT request to update Worker service settings..."
           PUT_RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "$PUT_API_URL" \
@@ -196,16 +180,15 @@ jobs:
           HTTP_CODE=$(echo "$PUT_RESPONSE" | tail -n1)
           BODY=$(echo "$PUT_RESPONSE" | sed '$d')
 
-          if [ "$HTTP_CODE" -ne 200 ]; then
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
             echo "❌ Cloudflare API Error (HTTP: $HTTP_CODE). Body:"
             echo "$BODY"
-            echo "💡 HINT: Ensure CF_API_TOKEN has permission 'workers.services:edit' (or appropriate workers.api:edit) and that CF_WORKER_NAME is exact service name."
+            echo "💡 Ensure CF_API_TOKEN has permission 'workers.services:edit' (or equivalent) and CF_WORKER_NAME is the exact service name."
             exit 1
           fi
 
           echo "✅ Cloudflare Worker Variable '${CF_VAR_NAME}' updated successfully in '${CF_ENVIRONMENT}'."
 
-  # JOB 2: Cleanup workflow runs (always runs after job1)
   cleanup-runs:
     runs-on: ubuntu-latest
     needs: update-proxy-variable
@@ -216,7 +199,7 @@ jobs:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
-          token: ${{ github.token }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 0
