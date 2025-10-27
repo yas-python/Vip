@@ -1,4 +1,3 @@
-# .github/workflows/RScanner.yml
 name: Rust Proxy Scanner for Workers (Ultimate/Final - Plaintext Var)
 
 # Triggers: manual + hourly schedule
