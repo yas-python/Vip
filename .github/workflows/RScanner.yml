@@ -129,13 +129,13 @@ jobs:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }} # Your worker script name
-        CF_VAR_NAME: ${{ secrets.CF_VAR_NAME }}       # The name of the secret (e.g., PROXYIP)
+        CF_VAR_NAME: ${{ secrets.CF_VAR_NAME }}       # The name of the secret (e.g., PROXY_IP)
         BESTIP: ${{ steps.scan.outputs.bestip }}
       run: |
         set -euo pipefail
         
         # --- Begin Validation ---
-        # ❗️ ***FIX 1***: Added validation for all required secrets to catch 10003 errors.
+        echo "ℹ️  Validating secrets and variables..."
         if [ -z "${CF_ACCOUNT_ID:-}" ]; then
           echo "❌ ERROR: CF_ACCOUNT_ID secret is not set."
           exit 1
@@ -159,15 +159,27 @@ jobs:
         echo "✅ All required secrets and variables are present."
         # --- End Validation ---
 
+        # ❗️ ***FIX 1: SANITIZE INPUTS***
+        # This removes leading/trailing whitespace (spaces, tabs, newlines)
+        # from secrets, which is the most common cause of error 10003.
+        echo "ℹ️  Sanitizing secret values..."
+        CF_ACCOUNT_ID_CLEAN=$(echo "$CF_ACCOUNT_ID" | xargs)
+        CF_WORKER_NAME_CLEAN=$(echo "$CF_WORKER_NAME" | xargs)
+        CF_VAR_NAME_CLEAN=$(echo "$CF_VAR_NAME" | xargs)
+        BESTIP_CLEAN=$(echo "$BESTIP" | xargs)
+
         # API Endpoint for updating a Worker's secrets
-        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/secrets"
+        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID_CLEAN}/workers/scripts/${CF_WORKER_NAME_CLEAN}/secrets"
+        
+        # ❗️ ***FIX 2: ENHANCED DEBUGGING***
+        # This prints the URL to the log (it contains no sensitive tokens).
+        # If it fails again, check this URL in the log to see if it's correct.
+        echo "ℹ️  Constructed API URL: $API_URL"
         
         # Build the JSON Payload for the PUT request
-        # ❗️ ***FIX 2***: Payload is correctly wrapped in an array [ ... ]
-        #    AND includes "type": "secret_text" for full API compliance.
         JSON_PAYLOAD=$(jq -n \
-          --arg var_name "$CF_VAR_NAME" \
-          --arg var_value "$BESTIP" \
+          --arg var_name "$CF_VAR_NAME_CLEAN" \
+          --arg var_value "$BESTIP_CLEAN" \
           '[{
               "name": $var_name,
               "text": $var_value,
@@ -191,8 +203,8 @@ jobs:
           exit 1
         fi
         
-        echo "✅ Cloudflare Worker secret '${CF_VAR_NAME}' updated successfully to '${BESTIP}'."
-        echo "ℹ️ Note: Worker secret changes are applied almost immediately without a new deployment."
+        echo "✅ Cloudflare Worker secret '${CF_VAR_NAME_CLEAN}' updated successfully to '${BESTIP_CLEAN}'."
+        echo "ℹ️  Note: Worker secret changes are applied almost immediately without a new deployment."
 
   # JOB 2: Cleanup workflow runs (in GitHub)
   cleanup-runs:
