@@ -1,211 +1,130 @@
-# Workflow name
+# Name of the workflow
 name: Rust Proxy Scanner for Cloudflare Workers (Ultimate)
 
-# Workflow triggers
+# Triggers for the workflow
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:  # Allows manual triggering
   schedule:
-    - cron: '0 * * * *'  # Automatic execution every hour
+    - cron: '0 * * * *'  # Runs automatically every hour
 
-# Ensure only one instance runs at a time
+# Ensures only one instance of this workflow runs at a time
 concurrency:
   group: rust-proxy-worker-scan
   cancel-in-progress: true
 
-# Global environment variables
+# Environment variables available to all jobs
 env:
+  # --- Configuration ---
   CARGO_TERM_COLOR: always
-  KEEP_DEPLOYMENTS: '3'  # Number of recent Worker deployments to retain
-  CACHE_FILE: .cachelastbestip.txt  # Cache file for the best IP address
-  RUST_CACHE_KEY: v1  # Increment to invalidate Rust cache manually
-  NODE_VERSION: '18'  # Node.js version for Wrangler CLI
+  CACHE_FILE: .cachelastbestip.txt # File to cache the last best IP
+  RUST_CACHE_KEY: v1 # Increment this to manually invalidate the Rust cache
 
 jobs:
-  # Main job: Scan proxies and update Cloudflare Worker
+  # This job finds the best proxy and updates Cloudflare Worker
   update-worker-proxy:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 30
     outputs:
       bestip: ${{ steps.scan.outputs.bestip }}
-      deployment_id: ${{ steps.deploy.outputs.deployment_id }}
 
     steps:
-    # Step 1: Checkout repository code
+    # 1. Checkout the repository code
     - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Full history for better Git operations
 
-    # Step 2: Setup required system tools
+    # 2. Set up the necessary tools
     - name: Setup system environment
       run: |
         sudo apt-get update -y
         sudo apt-get install -y jq curl python3 python3-pip netcat-openbsd
         python3 -m pip install --no-cache-dir requests
-        echo "✅ System environment configured successfully"
 
-    # Step 3: Setup Node.js for Wrangler CLI
+    # 3. Install Node.js for Wrangler CLI
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
+        node-version: '20'
 
-    # Step 4: Install Wrangler CLI (Cloudflare Workers deployment tool)
-    - name: Install Wrangler CLI
-      run: |
-        npm install -g wrangler
-        wrangler --version
-        echo "✅ Wrangler CLI installed successfully"
-
-    # Step 5: Restore cached best IP from previous runs
-    - name: Restore best IP cache
+    # 4. Restore best IP from cache (will be saved automatically at the end of the job)
+    - name: Manage Best IP Cache
       uses: actions/cache@v4
       id: ip-cache
       with:
         path: ${{ env.CACHE_FILE }}
-        key: rust-proxy-worker-best-ip-v2-${{ github.run_id }}
-        restore-keys: |
-          rust-proxy-worker-best-ip-v2-
+        key: rust-proxy-scanner-best-ip-cache
 
-    # Step 6: Install Rust toolchain
+    # 5. Install Rust toolchain and cache dependencies for faster builds
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
-
-    # Step 7: Cache Rust dependencies for faster builds
-    # Note: "Cache not found" on first run is normal - cache will be saved at job end
+      
+    # NOTE: The "Cache not found" warning you see is NORMAL for the first run.
+    # The cache is saved at the end of the job, so the warning will disappear on the next run.
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
         key: ${{ env.RUST_CACHE_KEY }}
-        cache-on-failure: true
 
-    # Step 8: Build the Rust scanner binary
+    # 6. Build the scanner program
     - name: Build Rust scanner project
-      run: |
-        echo "🔨 Building Rust project in release mode..."
-        cargo build --release --verbose
-        echo "✅ Build completed successfully"
+      run: cargo build --release
 
-    # Step 9: Execute scanner and identify the best proxy IP
+    # 7. Run the scanner and find the best IP with the lowest latency
     - name: Execute proxy scanner and select optimal IP
       id: scan
       run: |
-        set -euo pipefail  # Strict error handling
-        
+        set -euo pipefail # Exit on any error, making the script more robust
         BIN="./target/release/RScanner"
         chmod +x "$BIN"
-        : > scan.log  # Initialize empty log file
-        
-        echo "🚀 Initiating comprehensive proxy scan..."
-        echo "⏰ Scan started at: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-        
-        # Run scanner and capture output (continue even if scanner exits with error)
-        $BIN 2>&1 | tee -a scan.log || {
-          echo "⚠️ Scanner process terminated with non-zero exit code"
-          echo "   Will attempt to extract results from partial scan data..."
-        }
-        
+        : > scan.log # Clear previous log
+
+        echo "🚀 Starting comprehensive proxy scan..."
+        $BIN 2>&1 | tee -a scan.log || echo "⚠️ Scanner exited with a non-zero status. Will try to find proxies in partial results."
+
         BEST=""
         BEST_LAT=""
-        
-        echo ""
-        echo "🔍 Analyzing scan results for optimal proxy candidate..."
-        
-        # Parse scan log to extract IP addresses and latencies
-        # This AWK script looks for lines indicating live proxies with latency measurements
+
+        echo "🔍 Analyzing scan results for optimal proxy..."
         awk '
-          BEGIN { IGNORECASE=1 }
+          BEGIN{IGNORECASE=1}
           /PROXY[[:space:]]+LIVE/ {
-            # Extract latency in milliseconds
-            if (match($0, /\(([0-9]+)[[:space:]]*ms\)/, lat)) { 
-              latency = lat[1] 
-            } else { 
-              next 
-            }
-            
-            # Extract IP address
-            if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, addr)) { 
-              ip = addr[1] 
-            } else { 
-              next 
-            }
-            
-            # Output: latency ip_address
+            if (match($0, /\(([0-9]+)[[:space:]]*ms\)/, lat)) { latency=lat[1] } else next
+            if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/ , addr)) { ip=addr[1] } else next
             print latency, ip
           }
         ' scan.log | sort -n -k1,1 > candidates.txt
-        
-        # Check if we found any valid candidates
-        if [ -s candidates.txt ]; then
-          CANDIDATE_COUNT=$(wc -l < candidates.txt)
-          echo "✅ Found ${CANDIDATE_COUNT} live proxy candidate(s)"
-          
-          # Select the best (lowest latency) candidate
-          BEST_LAT=$(awk 'NR==1 {print $1}' candidates.txt)
-          BEST=$(awk 'NR==1 {print $2}' candidates.txt)
-          
-          echo "🏆 Selected optimal proxy from current scan:"
-          echo "   IP Address: $BEST"
-          echo "   Latency: ${BEST_LAT} ms"
-          
-          # Display top 5 candidates for reference
-          echo ""
-          echo "📊 Top 5 candidates (latency, IP):"
-          head -n 5 candidates.txt | awk '{print "   " $1 " ms - " $2}'
-        else
-          echo "🟡 No live proxies discovered in current scan"
-          echo "   Attempting to recover from cache..."
-        fi
-        
-        # Fallback to cached IP if no new candidate found
-        if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
-          BEST="$(tr -d ' \r\n\t' < ${CACHE_FILE})"
-          if [ -n "$BEST" ]; then
-            echo "✅ Successfully recovered cached IP: $BEST"
-            echo "   Note: Using previous best result due to scan failure"
-          fi
-        fi
-        
-        # Validate that we have a usable IP address
-        if [ -z "${BEST:-}" ]; then
-          echo ""
-          echo "❌ CRITICAL ERROR: No valid proxy IP found"
-          echo "   - Current scan yielded no results"
-          echo "   - No cached IP available for fallback"
-          echo "   - Cannot proceed with Worker deployment"
-          exit 1
-        fi
-        
-        # Final validation: check IP format
-        if ! echo "$BEST" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
-          echo "❌ ERROR: Invalid IP address format: $BEST"
-          exit 1
-        fi
-        
-        echo ""
-        echo "💾 Persisting selected IP to cache and workflow output..."
-        echo "$BEST" > "${CACHE_FILE}"
-        echo "bestip=$BEST" >> "$GITHUB_OUTPUT"
-        echo ""
-        echo "✅ Scan phase completed successfully"
-        echo "📍 Best IP: $BEST"
 
-    # Step 10: Upload scan log as artifact for debugging and analysis
-    - name: Upload scan log artifact
-      if: always()  # Run even if previous steps failed
+        if [ -s candidates.txt ]; then
+          BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
+          BEST=$(awk 'NR==1{print $2}' candidates.txt)
+          echo "✅ Selected best candidate from new scan: $BEST (latency: ${BEST_LAT} ms)"
+        else
+          echo "🟡 No live proxies found in the new scan. Checking for a cached IP."
+        fi
+
+        if [ -z "$BEST" ] && [ -f "${CACHE_FILE}" ]; then
+          BEST="$(tr -d ' \r\n' < ${CACHE_FILE})"
+          echo "✅ Using cached best IP: $BEST"
+        fi
+
+        if [ -z "${BEST:-}" ]; then
+          echo "❌ FATAL: No best candidate found from scan or cache. Aborting."
+          exit 1
+        fi
+
+        echo "💾 Saving '$BEST' to cache file and GitHub output."
+        echo "$BEST" > ${CACHE_FILE}
+        echo "bestip=$BEST" >> "$GITHUB_OUTPUT"
+
+    # 8. Upload the scan log as an artifact for debugging
+    - name: Upload scan.log for debug
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: proxy-scan-log-${{ github.run_id }}
-        path: |
-          scan.log
-          candidates.txt
-        retention-days: 7  # Keep logs for 7 days
+        name: scan-log-${{ github.run_id }}
+        path: scan.log
 
-    # Step 11: Update Worker environment variable via Cloudflare API
-    - name: Update Cloudflare Worker environment variable
+    # 9. Update Cloudflare Worker environment variable via API
+    - name: Update Cloudflare Worker Secret
       env:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -215,287 +134,96 @@ jobs:
       run: |
         set -euo pipefail
         
-        echo "🔧 Preparing to update Cloudflare Worker environment variable..."
-        
-        # Validate required inputs
         if [ -z "${BESTIP:-}" ]; then
-          echo "❌ ERROR: BESTIP variable is empty - cannot update Worker"
+          echo "❌ ERROR: BESTIP is empty; aborting Cloudflare update."
           exit 1
         fi
         
-        if [ -z "${CF_WORKER_NAME:-}" ]; then
-          echo "❌ ERROR: CF_WORKER_NAME secret not configured"
+        echo "📡 Validating secrets and variables..."
+        if [ -z "${CF_ACCOUNT_ID}" ] || [ -z "${CF_API_TOKEN}" ] || [ -z "${CF_WORKER_NAME}" ] || [ -z "${CF_VAR_NAME}" ]; then
+          echo "❌ ERROR: One or more required secrets are missing. Please check your repository secrets."
           exit 1
         fi
         
-        echo "📋 Configuration:"
-        echo "   Worker Name: ${CF_WORKER_NAME}"
-        echo "   Variable Name: ${CF_VAR_NAME}"
-        echo "   New Value: ${BESTIP}"
+        # API Endpoint for updating a Worker's secrets
+        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/secrets"
         
-        # Cloudflare API endpoint for Worker settings
-        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/settings"
-        
-        # First, fetch current environment variables to preserve them
-        echo ""
-        echo "📥 Fetching current Worker configuration..."
-        CURRENT_CONFIG=$(curl -s --fail -X GET "$API_URL" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" \
-          -H "Content-Type: application/json")
-        
-        # Extract existing bindings (preserve KV, Durable Objects, etc.)
-        EXISTING_BINDINGS=$(echo "$CURRENT_CONFIG" | jq -r '.result.bindings // []')
-        
-        # Create updated environment variables JSON
-        # This preserves all existing env vars and updates/adds our proxy IP variable
-        UPDATED_ENV_VARS=$(echo "$CURRENT_CONFIG" | jq -r '.result.bindings // []' | \
-          jq --arg var_name "$CF_VAR_NAME" --arg var_value "$BESTIP" '
-            map(select(.name != $var_name)) + 
-            [{
-              "type": "plain_text",
-              "name": $var_name,
-              "text": $var_value
-            }]
-          ')
-        
-        # Construct the complete settings payload
+        # Build the JSON Payload for the PUT request
         JSON_PAYLOAD=$(jq -n \
-          --argjson bindings "$UPDATED_ENV_VARS" \
-          '{bindings: $bindings}')
-        
-        echo "📡 Sending PATCH request to Cloudflare API..."
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X PATCH "$API_URL" \
+          --arg var_name "$CF_VAR_NAME" \
+          --arg var_value "$BESTIP" \
+          '{name: $var_name, text: $var_value, type: "secret_text"}')
+
+        echo "📡 Sending PUT request to Cloudflare API to update Worker secret..."
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT "$API_URL" \
           -H "Authorization: Bearer ${CF_API_TOKEN}" \
           -H "Content-Type: application/json" \
           --data "$JSON_PAYLOAD")
-        
+
         HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
         BODY=$(echo "$RESPONSE" | sed '$d')
-        
-        # Check if request was successful
+
         if [ "$HTTP_CODE" -ne 200 ]; then
           echo "❌ Error: Cloudflare API returned HTTP status $HTTP_CODE"
-          echo "Response details:"
-          echo "$BODY" | jq '.' || echo "$BODY"
+          echo "Response Body: $BODY"
           exit 1
         fi
         
-        # Verify the update was successful
-        SUCCESS=$(echo "$BODY" | jq -r '.success')
-        if [ "$SUCCESS" != "true" ]; then
-          echo "❌ Error: API request completed but reported failure"
-          echo "$BODY" | jq '.'
-          exit 1
-        fi
-        
-        echo "✅ Worker environment variable '${CF_VAR_NAME}' updated successfully"
-        echo "   New value: ${BESTIP}"
+        echo "✅ Cloudflare Worker secret '${CF_VAR_NAME}' updated successfully to '${BESTIP}'."
+        echo "📝 Note: Worker secret changes are applied almost immediately without requiring a new deployment."
 
-    # Step 12: Deploy updated Worker to Cloudflare
+    # 10. Deploy Cloudflare Worker using Wrangler
     - name: Deploy Cloudflare Worker
-      id: deploy
       env:
         CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
       run: |
         set -euo pipefail
         
-        echo "🚀 Initiating Cloudflare Worker deployment..."
+        echo "📦 Installing Wrangler CLI..."
+        npm install -g wrangler
         
-        # Check if wrangler.toml exists; if not, create a minimal one
-        if [ ! -f "wrangler.toml" ]; then
-          echo "📝 Creating minimal wrangler.toml configuration..."
-          cat > wrangler.toml << EOF
-        name = "${CF_WORKER_NAME}"
-        main = "src/index.js"
-        compatibility_date = "$(date +%Y-%m-%d)"
+        echo "🚀 Deploying Cloudflare Worker..."
+        wrangler deploy
         
-        [env.production]
-        vars = { ${CF_VAR_NAME} = "${BESTIP}" }
-        EOF
-          echo "✅ Configuration file created"
-        fi
-        
-        # Verify Worker source code exists
-        if [ ! -f "src/index.js" ] && [ ! -f "worker.js" ] && [ ! -f "index.js" ]; then
-          echo "⚠️ Warning: No Worker script found (src/index.js, worker.js, or index.js)"
-          echo "   Creating a minimal Worker script for testing..."
-          mkdir -p src
-          cat > src/index.js << 'EOF'
-        export default {
-          async fetch(request, env) {
-            return new Response(JSON.stringify({
-              PROXYIP: env.PROXYIP || 'not set',
-              timestamp: new Date().toISOString(),
-              status: 'active'
-            }), {
-              headers: { 'Content-Type': 'application/json' }
-            });
-          }
-        };
-        EOF
-        fi
-        
-        echo "📦 Deploying Worker to Cloudflare..."
-        
-        # Deploy using Wrangler CLI
-        DEPLOY_OUTPUT=$(wrangler deploy --env production 2>&1) || {
-          echo "❌ Deployment failed"
-          echo "$DEPLOY_OUTPUT"
-          exit 1
-        }
-        
-        echo "$DEPLOY_OUTPUT"
-        
-        # Extract deployment ID if available
-        DEPLOYMENT_ID=$(echo "$DEPLOY_OUTPUT" | grep -oP 'deployment-id: \K[a-f0-9-]+' || echo "unknown")
-        echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
-        
-        echo ""
-        echo "✅ Worker deployed successfully"
-        echo "🆔 Deployment ID: $DEPLOYMENT_ID"
-        echo "🌐 Worker URL: https://${CF_WORKER_NAME}.workers.dev"
+        echo "✅ Worker deployed successfully!"
 
-    # Step 13: Verify Worker deployment and functionality
+    # 11. Verify Worker deployment
     - name: Verify Worker deployment
-      env:
-        CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
-        BESTIP: ${{ steps.scan.outputs.bestip }}
-      run: |
-        set -euo pipefail
-        
-        echo "🔍 Verifying Worker deployment and configuration..."
-        
-        WORKER_URL="https://${CF_WORKER_NAME}.workers.dev"
-        
-        # Wait a moment for deployment to propagate
-        echo "⏳ Waiting 10 seconds for deployment propagation..."
-        sleep 10
-        
-        # Test Worker endpoint
-        echo "📡 Testing Worker endpoint: $WORKER_URL"
-        RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 15 "$WORKER_URL") || {
-          echo "⚠️ Warning: Could not reach Worker endpoint (this may be normal if Worker has custom routing)"
-          exit 0
-        }
-        
-        HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-        BODY=$(echo "$RESPONSE" | sed '$d')
-        
-        echo "Response Status: $HTTP_CODE"
-        
-        if [ "$HTTP_CODE" -eq 200 ]; then
-          echo "✅ Worker is responding successfully"
-          echo "Response:"
-          echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
-          
-          # If response is JSON, verify proxy IP is set correctly
-          if echo "$BODY" | jq -e '.PROXYIP' >/dev/null 2>&1; then
-            PROXYIP=$(echo "$BODY" | jq -r '.PROXYIP')
-            if [ "$PROXYIP" = "$BESTIP" ]; then
-              echo "✅ Proxy IP verified correctly in Worker: $PROXYIP"
-            else
-              echo "⚠️ Warning: Proxy IP mismatch (expected: $BESTIP, got: $PROXYIP)"
-            fi
-          fi
-        else
-          echo "⚠️ Unexpected HTTP status: $HTTP_CODE"
-        fi
-
-    # Step 14: Cleanup old Worker versions/deployments
-    - name: Cleanup old Worker deployments
-      if: always()
       env:
         CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
-        KEEP: ${{ env.KEEP_DEPLOYMENTS }}
       run: |
         set -euo pipefail
         
-        echo "🧹 Starting cleanup of old Worker deployments..."
+        echo "🔍 Verifying Worker deployment status..."
+        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}"
         
-        # Cloudflare Workers API endpoint for deployments
-        API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_WORKER_NAME}/deployments"
+        RESPONSE=$(curl -s --fail -X GET "$API_URL" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}")
         
-        echo "📥 Fetching deployment history..."
-        DEPLOYMENTS_RESPONSE=$(curl -s --fail -X GET "$API_URL" \
-          -H "Authorization: Bearer ${CF_API_TOKEN}" \
-          -H "Content-Type: application/json") || {
-          echo "⚠️ Could not fetch deployments (API may not support this endpoint)"
-          echo "   Skipping cleanup step"
-          exit 0
-        }
-        
-        # Check if we got valid JSON response
-        if ! echo "$DEPLOYMENTS_RESPONSE" | jq -e '.result' >/dev/null 2>&1; then
-          echo "⚠️ No deployment history available or API structure changed"
-          echo "   Skipping cleanup"
-          exit 0
+        if echo "$RESPONSE" | jq -e '.success == true' > /dev/null; then
+          echo "✅ Worker is active and running."
+          echo "📊 Worker details:"
+          echo "$RESPONSE" | jq '.result | {id, created_on, modified_on}'
+        else
+          echo "⚠️ Warning: Could not verify Worker status."
+          echo "$RESPONSE" | jq '.'
         fi
-        
-        # Extract deployment IDs to delete (keep most recent N deployments)
-        IDS_TO_DELETE=$(echo "$DEPLOYMENTS_RESPONSE" | jq -r \
-          ".result | sort_by(.created_on) | reverse | .[${KEEP}:] | .[]? | .id" 2>/dev/null || echo "")
-        
-        if [ -z "$IDS_TO_DELETE" ]; then
-          echo "👍 No old deployments to clean up"
-          echo "   Current deployment count is within retention limit"
-          exit 0
-        fi
-        
-        DELETION_COUNT=$(echo "$IDS_TO_DELETE" | wc -l)
-        echo "🗑️  Found ${DELETION_COUNT} old deployment(s) to remove"
-        echo ""
-        
-        # Delete each old deployment
-        for deployment_id in $IDS_TO_DELETE; do
-          echo "   Deleting deployment: $deployment_id"
-          
-          DELETE_RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE \
-            "${API_URL}/${deployment_id}" \
-            -H "Authorization: Bearer ${CF_API_TOKEN}") || {
-            echo "     ⚠️ Delete request failed for $deployment_id"
-            continue
-          }
-          
-          DELETE_HTTP_CODE=$(echo "$DELETE_RESPONSE" | tail -n1)
-          DELETE_BODY=$(echo "$DELETE_RESPONSE" | sed '$d')
-          
-          if [ "$DELETE_HTTP_CODE" -eq 200 ] || [ "$DELETE_HTTP_CODE" -eq 204 ]; then
-            echo "     ✅ Successfully deleted"
-          else
-            echo "     ⚠️ Failed to delete (HTTP $DELETE_HTTP_CODE)"
-            echo "     Response: $DELETE_BODY"
-          fi
-        done
-        
-        echo ""
-        echo "✅ Deployment cleanup completed"
 
-  # Job 2: Cleanup old workflow runs to maintain clean Actions history
+  # JOB 2: Cleanup workflow runs to keep the Actions history clean
   cleanup-workflow-runs:
     runs-on: ubuntu-latest
     needs: update-worker-proxy
-    if: always()  # Run even if main job fails
+    if: always()
     permissions:
-      actions: write  # Required permission to delete workflow runs
-    
+      actions: write
     steps:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
-          retain_days: 0  # Delete all runs older than today
-          keep_minimum_runs: 3  # But always keep at least 3 most recent runs
-          delete_workflow_pattern: 'Rust Proxy Scanner for Cloudflare Workers (Ultimate)'
-        continue-on-error: true  # Don't fail workflow if cleanup fails
-
-      - name: Cleanup summary
-        if: always()
-        run: |
-          echo "✅ Workflow run cleanup completed"
-          echo "   Retention policy: Keep minimum 3 most recent runs"
-          echo "   This helps maintain a clean Actions history and stay within GitHub limits"
+          retain_days: 0
+          keep_minimum_runs: 0
