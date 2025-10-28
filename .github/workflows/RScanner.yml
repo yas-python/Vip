@@ -1,261 +1,450 @@
-name: Rust Proxy Scanner (Ultimate) - KV update    
-    
-# triggers: manual + hourly    
-on:    
-  workflow_dispatch:    
-  schedule:    
-    - cron: '0 * * * *' # every hour    
-    
-concurrency:    
-  group: rust-proxy-scan-final-plaintext    
-  cancel-in-progress: true    
-    
-permissions:    
-  contents: read    
-  actions: write    
-    
-env:    
-  CARGO_TERM_COLOR: always    
-  CACHE_FILE: .cachelastbestip.txt    
-  RUST_CACHE_KEY: v4    
-  CF_ENVIRONMENT: production    
-  SCAN_BINARY: ./target/release/RScanner    
-  SCAN_LOG: scan.log    
-  MAX_CF_RETRIES: "5"    
-  CF_RETRY_BASE_SLEEP: "2"    
-    
-jobs:    
-  update-proxy-variable:    
-    name: Build → Scan → Update Cloudflare KV (RScanner)    
-    runs-on: ubuntu-latest    
-    timeout-minutes: 45    
-    outputs:    
-      bestip: ${{ steps.scan.outputs.bestip }}    
-    
-    steps:    
-      - name: Checkout repository (full)    
-        uses: actions/checkout@v4    
-        with:    
-          fetch-depth: 0    
-    
-      - name: Install system deps (jq, curl, build tools, libssl)    
-        run: |    
-          set -euo pipefail    
-          echo "=> apt-get update..."    
-          sudo apt-get update -y    
-          echo "=> installing packages..."    
-          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates    
-    
-      - name: Restore Best IP Cache    
-        uses: actions/cache@v4    
-        id: ip-cache    
-        with:    
-          path: ${{ env.CACHE_FILE }}    
-          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}    
-    
-      - name: Install Rust toolchain (stable)    
-        uses: dtolnay/rust-toolchain@stable    
-        with:    
-          toolchain: stable    
-    
-      - name: Cache Rust artifacts & registry    
-        uses: actions/cache@v4    
-        with:    
-          path: |    
-            target    
-            ~/.cargo/registry    
-            ~/.cargo/git    
-          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}    
-    
-      - name: Build Rust project (release)    
-        run: |    
-          set -euo pipefail    
-          echo "=> cargo build --release (start)"    
-          if ! cargo build --release 2>&1 | tee build-output.log; then    
-            echo "❌ cargo build failed. Showing last 200 lines from build-output.log"    
-            tail -n 200 build-output.log || true    
-            exit 1    
-          fi    
-          echo "✅ cargo build completed."    
-          ls -la target/release || true    
-    
-      - name: Run scanner and choose best IP    
-        id: scan    
-        run: |    
-          set -euo pipefail    
-          echo "=== Scanner step start ==="    
-          BIN="${{ env.SCAN_BINARY }}"    
-          LOG="${{ env.SCAN_LOG }}"    
-          CACHE_FILE="${{ env.CACHE_FILE }}"    
-          : > "$LOG"    
-    
-          echo "→ Checking scanner binary at $BIN"    
-          if [ ! -f "$BIN" ]; then    
-            echo "❌ FATAL: Scanner executable not found at $BIN"    
-            exit 1    
-          fi    
-    
-          chmod +x "$BIN" || true    
-          echo "🚀 Running scanner (output → $LOG). Scanner may exit non-zero; we will still attempt to parse results."    
-          "$BIN" 2>&1 | tee -a "$LOG" || echo "⚠️ Scanner exited with non-zero status; continue to parse log."    
-    
-          echo "🔍 Parsing scan.log for 'PROXY ... LIVE' lines with latency and IPv4"    
-          awk '    
-            BEGIN{IGNORECASE=1}    
-            /PROXY[[:space:]]+LIVE/ {    
-              if (match($0, /([0-9]+)[[:space:]]*ms/, lat)) { latency=lat[1] } else next    
-              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/ , addr)) { ip=addr[1] } else next    
-              print latency, ip    
-            }    
-          ' "$LOG" | sort -n -k1,1 > candidates.txt || true    
-    
-          BEST=""    
-          BEST_LAT=""    
-    
-          if [ -s candidates.txt ]; then    
-            BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)    
-            BEST=$(awk 'NR==1{print $2}' candidates.txt)    
-            echo "✅ Selected best candidate from scan: $BEST (latency ${BEST_LAT} ms)"    
-          else    
-            echo "🟡 No live proxies parsed from $LOG. Attempting cache fallback..."    
-          fi    
-    
-          # Fallback: cached file    
-          if [ -z "${BEST:-}" ] && [ -f "${CACHE_FILE}" ]; then    
-            CAND=$(tr -d ' \r\n' < ${CACHE_FILE} || true)    
-            echo "🔁 Found cache value: '$CAND'"    
-            if [[ "$CAND" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then    
-              BEST="$CAND"    
-              echo "✅ Using cached IP: $BEST"    
-            else    
-              echo "⚠️ Cached file exists but value invalid: '$CAND'. Ignoring."    
-            fi    
-          fi    
-    
-          # Final check for failure    
-          if [ -z "${BEST:-}" ]; then    
-            echo "❌ FATAL: No best IP found from scan or cache."    
-            tail -n 200 "$LOG" || true    
-            exit 1    
-          fi    
-    
-          echo "💾 Persisting best IP to cache file (${CACHE_FILE})"    
-          echo "$BEST" > ${CACHE_FILE} || true    
-    
-          # Export output correctly for GitHub Actions    
-          echo "bestip=${BEST}" >> "$GITHUB_OUTPUT"    
-          echo "✅ Scanner step complete. bestip=${BEST}"    
-          echo "=== Scanner step end ==="    
-    
-      - name: Upload scan.log for debugging (always)    
-        if: always()    
-        uses: actions/upload-artifact@v4    
-        with:    
-          name: scan-log-${{ github.run_id }}    
-          path: ${{ env.SCAN_LOG }}    
-    
-      # -----------------------    
-      # Update Cloudflare KV    
-      # -----------------------    
-      - name: Update Cloudflare KV (REST API) with retries + health-check    
-        id: update-kv    
-        env:    
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}    
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}    
-          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}    
-          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}    
-          CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}    
-          BESTIP: ${{ steps.scan.outputs.bestip }}    
-          MAX_RETRIES: ${{ env.MAX_CF_RETRIES }}    
-          BASE_SLEEP: ${{ env.CF_RETRY_BASE_SLEEP }}    
-        run: |    
-          set -euo pipefail    
-          : "${BESTIP:?BESTIP required from scanner}"    
-          : "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID is required}"    
-          : "${CF_API_TOKEN:?CF_API_TOKEN is required}"    
-          : "${CF_KV_NAMESPACE_ID:?CF_KV_NAMESPACE_ID is required}"    
-          : "${CF_VAR_KEY:?CF_VAR_KEY is required}"    
-          : "${CF_WORKER_NAME:?CF_WORKER_NAME is required}"    
-    
-          echo "=== Cloudflare KV update step start ==="    
-          echo "Setting KV key '${CF_VAR_KEY}' -> '${BESTIP}' in namespace ${CF_KV_NAMESPACE_ID}"    
-    
-          retry_put() {    
-            local attempt=1    
-            local max="${MAX_RETRIES:-5}"    
-            local base_sleep="${BASE_SLEEP:-2}"    
-            while [ "$attempt" -le "$max" ]; do    
-              echo "→ Attempt #${attempt} to PUT KV"    
-              # PUT value (no auth header content-type necessary)    
-              response=$(curl -s -w "\n%{http_code}" -X PUT \    
-                "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_VAR_KEY}" \    
-                -H "Authorization: Bearer ${CF_API_TOKEN}" \    
-                --data-binary "${BESTIP}" ) || response=""    
-              http_code=$(echo "$response" | tail -n1)    
-              body=$(echo "$response" | sed '$d' || echo "")    
-              if [ -n "$http_code" ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then    
-                echo "→ KV PUT succeeded (HTTP ${http_code})."    
-                echo "$body"    
-                return 0    
-              else    
-                echo "⚠️ KV PUT HTTP ${http_code}. Body (truncated):"    
-                echo "$body" | sed -n '1,200p' || true    
-                if [ "$attempt" -lt "$max" ]; then    
-                  sleep_seconds=$(( base_sleep ** attempt ))    
-                  echo "⏳ Sleeping ${sleep_seconds}s before retry..."    
-                  sleep $sleep_seconds    
-                fi    
-              fi    
-              attempt=$((attempt+1))    
-            done    
-            echo "❌ All attempts to PUT KV failed."    
-            return 1    
-          }    
-    
-          if ! retry_put; then    
-            echo "❌ Failed to update KV after retries. Aborting to avoid inconsistent state."    
-            exit 1    
-          fi    
-    
-          echo "✅ KV updated to ${BESTIP}. Proceeding to health-check."    
-    
-          # Health-check loop: try /health endpoint a few times until success    
-          HEALTH_URL="https://${CF_WORKER_NAME}.${{ secrets.CF_ACCOUNT_ID }}.workers.dev/health"    
-          # If your worker is bound to a domain, replace above with proper URL: https://example.com/health    
-          echo "Health-check URL: ${HEALTH_URL}"    
-    
-          attempt=1    
-          max=5    
-          while [ "$attempt" -le "$max" ]; do    
-            echo "→ Healthcheck attempt #${attempt}..."    
-            status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${HEALTH_URL}" || echo "000")    
-            echo "→ HTTP ${status}"    
-            if [ "$status" = "200" ]; then    
-              echo "✅ Healthcheck OK."    
-              echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"    
-              exit 0    
-            fi    
-            sleep 2    
-            attempt=$((attempt+1))    
-          done    
-    
-          echo "⚠️ Healthcheck failed after ${max} attempts — but KV is updated. Please inspect Worker / logs."    
-          echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"    
-          # Do not fail the workflow if healthcheck fails (config updated) — but mark as warning    
-          exit 0    
-    
-  cleanup-runs:    
-    name: Cleanup old workflow runs    
-    runs-on: ubuntu-latest    
-    needs: update-proxy-variable    
-    if: always()    
-    permissions:    
-      actions: write    
-    steps:    
-      - name: Delete old workflow runs (retain 0 days / keep 0)    
-        uses: Mattraks/delete-workflow-runs@v2    
-        with:    
-          token: ${{ secrets.GITHUB_TOKEN }}    
-          repository: ${{ github.repository }}    
-          retain_days: 0    
-          keep_minimum_runs: 0    
+name: Rust Proxy Scanner (Ultimate) - KV Update
+
+# triggers: manual + hourly
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *' # every hour
+
+concurrency:
+  group: rust-proxy-scan-final-plaintext
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CACHE_FILE: .cachelastbestip.txt
+  RUST_CACHE_KEY: v4
+  CF_ENVIRONMENT: production
+  SCAN_BINARY: ./target/release/RScanner
+  SCAN_LOG: scan.log
+  MAX_CF_RETRIES: "5"
+  CF_RETRY_BASE_SLEEP: "2"
+  SCANNER_TIMEOUT: "600" # 10 minutes for scanner execution
+
+jobs:
+  update-proxy-variable:
+    name: Build → Scan → Update Cloudflare KV (RScanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      bestip: ${{ steps.scan.outputs.bestip }}
+
+    steps:
+      - name: Checkout repository (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system deps (jq, curl, build tools, libssl)
+        run: |
+          set -euo pipefail
+          echo "=> apt-get update..."
+          sudo apt-get update -y
+          echo "=> installing packages..."
+          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates
+
+      - name: Restore Best IP Cache
+        uses: actions/cache@v4
+        id: ip-cache
+        with:
+          path: ${{ env.CACHE_FILE }}
+          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
+          restore-keys: |
+            rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-
+            rust-proxy-scanner-best-ip-cache-
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust artifacts & registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rust-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}-
+
+      - name: Build Rust project (release)
+        run: |
+          set -euo pipefail
+          echo "=> cargo build --release (start)"
+          echo "=> Build timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          if ! cargo build --release 2>&1 | tee build-output.log; then
+            echo "❌ cargo build failed. Showing last 200 lines from build-output.log"
+            tail -n 200 build-output.log || true
+            exit 1
+          fi
+          echo "✅ cargo build completed successfully."
+          ls -lah target/release/ || true
+          if [ -f "${{ env.SCAN_BINARY }}" ]; then
+            file "${{ env.SCAN_BINARY }}" || true
+            echo "✅ Scanner binary exists and is ready."
+          else
+            echo "❌ WARNING: Scanner binary not found after build!"
+          fi
+
+      - name: Run scanner and choose best IP
+        id: scan
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          echo "=== Scanner step start ==="
+          echo "=> Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          BIN="${{ env.SCAN_BINARY }}"
+          LOG="${{ env.SCAN_LOG }}"
+          CACHE_FILE="${{ env.CACHE_FILE }}"
+          TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
+          
+          # Initialize log file
+          : > "$LOG"
+
+          echo "→ Checking scanner binary at $BIN"
+          if [ ! -f "$BIN" ]; then
+            echo "❌ FATAL: Scanner executable not found at $BIN"
+            ls -la target/release/ || true
+            exit 1
+          fi
+
+          chmod +x "$BIN" || true
+          
+          echo "🚀 Running scanner with timeout of ${TIMEOUT}s (output → $LOG)"
+          echo "=> Scanner will scan proxies and may encounter some failures - this is normal"
+          
+          # Run scanner with timeout to prevent hanging
+          if timeout "${TIMEOUT}s" "$BIN" 2>&1 | tee -a "$LOG"; then
+            echo "✅ Scanner completed successfully"
+          else
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+              echo "⚠️ Scanner timed out after ${TIMEOUT}s - will attempt to parse partial results"
+            else
+              echo "⚠️ Scanner exited with code $EXIT_CODE - will attempt to parse available results"
+            fi
+          fi
+
+          echo "=> End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "=> Log file size: $(wc -l < "$LOG") lines"
+
+          echo "🔍 Parsing scan.log for 'PROXY ... LIVE' lines with latency and IPv4"
+          echo "=> Looking for pattern: PROXY LIVE [IP] ([latency] ms)"
+          
+          # More robust parsing that handles various log formats
+          awk '
+            BEGIN{IGNORECASE=1}
+            /PROXY[[:space:]]+LIVE/ {
+              # Extract IP address (IPv4 format)
+              if (match($0, /([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})/, addr)) {
+                ip = addr[1]
+              } else {
+                next
+              }
+              
+              # Extract latency in milliseconds
+              if (match($0, /\(([0-9]+)[[:space:]]*ms\)/, lat)) {
+                latency = lat[1]
+              } else if (match($0, /([0-9]+)[[:space:]]*ms/, lat)) {
+                latency = lat[1]
+              } else {
+                next
+              }
+              
+              # Validate IP format more strictly
+              split(ip, octets, ".")
+              valid = 1
+              for (i = 1; i <= 4; i++) {
+                if (octets[i] < 0 || octets[i] > 255) {
+                  valid = 0
+                  break
+                }
+              }
+              
+              if (valid) {
+                print latency, ip
+              }
+            }
+          ' "$LOG" | sort -n -k1,1 | head -n 20 > candidates.txt || true
+
+          echo "=> Found $(wc -l < candidates.txt) candidate IPs"
+          
+          if [ -s candidates.txt ]; then
+            echo "=> Top 5 candidates by latency:"
+            head -n 5 candidates.txt | while read lat ip; do
+              echo "   - $ip (${lat}ms)"
+            done
+          fi
+
+          BEST=""
+          BEST_LAT=""
+
+          # Strategy 1: Use best IP from current scan
+          if [ -s candidates.txt ]; then
+            BEST_LAT=$(awk 'NR==1{print $1}' candidates.txt)
+            BEST=$(awk 'NR==1{print $2}' candidates.txt)
+            echo "✅ Selected best candidate from scan: $BEST (latency ${BEST_LAT}ms)"
+          else
+            echo "🟡 No live proxies parsed from $LOG."
+            echo "=> Showing last 50 lines of scan log for debugging:"
+            tail -n 50 "$LOG" || true
+          fi
+
+          # Strategy 2: Fallback to cached IP if no new scan results
+          if [ -z "${BEST:-}" ] && [ -f "${CACHE_FILE}" ]; then
+            echo "🔁 Attempting to use cached IP from previous successful scan..."
+            CAND=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
+            echo "=> Cache file contents: '$CAND'"
+            
+            if [[ "$CAND" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+              BEST="$CAND"
+              echo "✅ Using cached IP from previous scan: $BEST"
+            else
+              echo "⚠️ Cached file exists but contains invalid IP format: '$CAND'"
+            fi
+          fi
+
+          # Strategy 3: Final validation
+          if [ -z "${BEST:-}" ]; then
+            echo "❌ FATAL: No valid IP found from scan or cache."
+            echo "=> Dumping full scan log for debugging:"
+            cat "$LOG" || true
+            echo "=> Showing directory contents:"
+            ls -la || true
+            exit 1
+          fi
+
+          # Validate the final IP format one more time
+          if ! [[ "$BEST" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "❌ FATAL: Selected IP has invalid format: '$BEST'"
+            exit 1
+          fi
+
+          echo "💾 Persisting best IP to cache file (${CACHE_FILE})"
+          echo -n "$BEST" > "${CACHE_FILE}" || true
+          
+          # Verify cache write
+          if [ -f "${CACHE_FILE}" ]; then
+            VERIFY=$(cat "${CACHE_FILE}")
+            echo "=> Cache verification: wrote '$VERIFY'"
+          fi
+
+          # Export to GitHub Actions outputs
+          echo "bestip=${BEST}" >> "$GITHUB_OUTPUT"
+          echo "✅ Scanner step complete. Selected IP: ${BEST}"
+          if [ -n "${BEST_LAT:-}" ]; then
+            echo "=> Latency: ${BEST_LAT}ms"
+          fi
+          echo "=== Scanner step end ==="
+
+      - name: Upload scan.log for debugging (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-log-${{ github.run_id }}
+          path: ${{ env.SCAN_LOG }}
+          retention-days: 7
+
+      - name: Upload candidates file for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidates-${{ github.run_id }}
+          path: candidates.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # -----------------------
+      # Update Cloudflare KV
+      # -----------------------
+      - name: Update Cloudflare KV (REST API) with retries + health-check
+        id: update-kv
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
+          BESTIP: ${{ steps.scan.outputs.bestip }}
+          MAX_RETRIES: ${{ env.MAX_CF_RETRIES }}
+          BASE_SLEEP: ${{ env.CF_RETRY_BASE_SLEEP }}
+        run: |
+          set -euo pipefail
+          
+          echo "=== Cloudflare KV update step start ==="
+          echo "=> Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          
+          # Validate all required variables
+          : "${BESTIP:?ERROR: BESTIP is required from scanner step}"
+          : "${CF_ACCOUNT_ID:?ERROR: CF_ACCOUNT_ID secret is required}"
+          : "${CF_API_TOKEN:?ERROR: CF_API_TOKEN secret is required}"
+          : "${CF_KV_NAMESPACE_ID:?ERROR: CF_KV_NAMESPACE_ID secret is required}"
+          : "${CF_VAR_KEY:?ERROR: CF_VAR_KEY secret is required}"
+          : "${CF_WORKER_NAME:?ERROR: CF_WORKER_NAME secret is required}"
+
+          echo "=> Configuration:"
+          echo "   - KV Namespace ID: ${CF_KV_NAMESPACE_ID}"
+          echo "   - KV Key: ${CF_VAR_KEY}"
+          echo "   - Best IP: ${BESTIP}"
+          echo "   - Worker Name: ${CF_WORKER_NAME}"
+
+          # Function to update KV with exponential backoff retry
+          retry_put() {
+            local attempt=1
+            local max="${MAX_RETRIES:-5}"
+            local base_sleep="${BASE_SLEEP:-2}"
+            
+            while [ "$attempt" -le "$max" ]; do
+              echo ""
+              echo "→ Attempt #${attempt}/${max} to PUT KV value"
+              echo "   URL: https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_VAR_KEY}"
+              
+              # Make the API request
+              response=$(curl -s -w "\n%{http_code}" -X PUT \
+                "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_VAR_KEY}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                -H "Content-Type: text/plain" \
+                --data-binary "${BESTIP}" \
+                --max-time 30 \
+                --connect-timeout 10) || response="000"
+              
+              http_code=$(echo "$response" | tail -n1)
+              body=$(echo "$response" | sed '$d')
+              
+              echo "   HTTP Status: ${http_code}"
+              
+              # Check for success (2xx status codes)
+              if [ -n "$http_code" ] && [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+                echo "✅ KV PUT succeeded!"
+                if [ -n "$body" ]; then
+                  echo "   Response body: $body"
+                fi
+                return 0
+              else
+                echo "⚠️ KV PUT failed with HTTP ${http_code}"
+                if [ -n "$body" ]; then
+                  echo "   Response body (first 500 chars):"
+                  echo "$body" | head -c 500
+                  echo ""
+                fi
+                
+                # Check if it's a rate limit or temporary error
+                if [ "$http_code" = "429" ] || [ "$http_code" = "503" ] || [ "$http_code" = "504" ]; then
+                  echo "   → Temporary error detected, will retry"
+                elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+                  echo "❌ Authentication error - check your CF_API_TOKEN"
+                  return 1
+                elif [ "$http_code" = "404" ]; then
+                  echo "❌ Resource not found - check CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID"
+                  return 1
+                fi
+                
+                # Retry logic
+                if [ "$attempt" -lt "$max" ]; then
+                  sleep_seconds=$(( base_sleep * attempt ))
+                  echo "   ⏳ Waiting ${sleep_seconds}s before retry..."
+                  sleep "$sleep_seconds"
+                else
+                  echo "❌ All ${max} attempts exhausted"
+                fi
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+            
+            return 1
+          }
+
+          # Execute the KV update with retries
+          if ! retry_put; then
+            echo ""
+            echo "❌ FATAL: Failed to update Cloudflare KV after all retry attempts"
+            echo "=> This likely indicates a configuration or authentication problem"
+            echo "=> Please verify:"
+            echo "   1. CF_API_TOKEN has correct permissions (Edit Cloudflare Workers)"
+            echo "   2. CF_ACCOUNT_ID is correct"
+            echo "   3. CF_KV_NAMESPACE_ID exists and is accessible"
+            echo "   4. Network connectivity to Cloudflare API"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ KV successfully updated to: ${BESTIP}"
+          echo "=> Proceeding to health check..."
+
+          # Health check with retry logic
+          HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
+          echo "=> Health check URL: ${HEALTH_URL}"
+          echo "=> Note: If your worker uses a custom domain, this check might fail"
+          
+          attempt=1
+          max_health_attempts=5
+          health_success=false
+          
+          while [ "$attempt" -le "$max_health_attempts" ]; do
+            echo ""
+            echo "→ Health check attempt #${attempt}/${max_health_attempts}"
+            
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 10 \
+              --connect-timeout 5 \
+              "${HEALTH_URL}" 2>/dev/null || echo "000")
+            
+            echo "   HTTP Status: ${status}"
+            
+            if [ "$status" = "200" ]; then
+              echo "✅ Health check PASSED - Worker is responding correctly"
+              health_success=true
+              break
+            elif [ "$status" = "404" ]; then
+              echo "⚠️ Health endpoint not found - worker might not have /health route"
+              echo "   This is OK if your worker doesn't implement health checks"
+              health_success=true
+              break
+            else
+              echo "⚠️ Health check returned ${status}"
+              if [ "$attempt" -lt "$max_health_attempts" ]; then
+                echo "   Waiting 3s before next attempt..."
+                sleep 3
+              fi
+            fi
+            
+            attempt=$((attempt + 1))
+          done
+
+          echo ""
+          if [ "$health_success" = true ]; then
+            echo "✅ Cloudflare KV update completed successfully!"
+          else
+            echo "⚠️ WARNING: Health check did not pass, but KV was updated"
+            echo "=> The proxy IP has been set to: ${BESTIP}"
+            echo "=> Please manually verify your Worker is functioning correctly"
+          fi
+          
+          # Always export the bestip output
+          echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
+          echo "=> End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "=== Cloudflare KV update step end ==="
+
+  cleanup-runs:
+    name: Cleanup old workflow runs
+    runs-on: ubuntu-latest
+    needs: update-proxy-variable
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs (retain 0 days / keep 0)
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0
