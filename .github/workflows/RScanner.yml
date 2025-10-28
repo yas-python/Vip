@@ -122,7 +122,7 @@ jobs:
           
           echo "🚀 Executing scanner (timeout: ${TIMEOUT}s)"
           
-          # Run scanner and capture output without pipe breaking
+          # Run scanner and capture output
           set +e
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1
           SCANNER_EXIT_CODE=$?
@@ -144,27 +144,30 @@ jobs:
 
           echo "🔍 Parsing results for live proxies..."
           
-          # Extract IP addresses and latencies from PROXY LIVE entries
-          # This captures patterns like: PROXY LIVE ✅: 20.63.17.53 (1615ms)
-          grep -iE "PROXY[[:space:]]+LIVE" "$LOG" | \
-            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*ms\)' | \
-            sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*ms\)/\2 \1/' | \
+          # Extract IP addresses and latencies - looking for patterns like:
+          # "PROXY LIVE ✅: 20.63.17.53 (1615ms)" or similar formats
+          grep -iE "(PROXY[[:space:]]+LIVE|selected.*IP|best.*IP)" "$LOG" | \
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
+            sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
             awk '{
-              # Validate IP format
+              # Validate IP format (each octet must be 0-255)
               split($2, octets, ".")
               if (length(octets) == 4) {
                 valid = 1
                 for (i = 1; i <= 4; i++) {
-                  if (octets[i] < 0 || octets[i] > 255) {
+                  if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) {
                     valid = 0
                     break
                   }
                 }
-                if (valid) print $1, $2
+                # Validate latency is a positive number
+                if (valid && $1 ~ /^[0-9]+$/ && $1 > 0) {
+                  print $1, $2
+                }
               }
             }' > unsorted_candidates.txt || touch unsorted_candidates.txt
           
-          # Sort by latency (lowest first) and take top 20
+          # Sort by latency numerically (lowest ping first) and take top 20
           if [ -s unsorted_candidates.txt ]; then
             sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || {
               echo "⚠️ Sort command failed, using unsorted data"
@@ -178,31 +181,45 @@ jobs:
           echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
           
           if [ "$CANDIDATES_COUNT" -gt 0 ]; then
-            echo "=> Top 5 candidates:"
+            echo "=> Top 5 candidates (sorted by lowest latency):"
             head -n 5 candidates.txt | while read -r latency ip; do
-              echo "   • $ip (${latency}ms)"
+              echo "   • $ip → ${latency}ms latency"
             done
           fi
 
           BEST_IP=""
           BEST_LATENCY=""
 
-          # Select the IP with the lowest latency (first line after sorting)
+          # Select the IP with the LOWEST latency (first line after numerical sort)
           if [ -s candidates.txt ]; then
             read -r BEST_LATENCY BEST_IP < candidates.txt
-            echo "✅ Best IP from current scan: $BEST_IP (${BEST_LATENCY}ms)"
+            echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms latency"
           else
-            echo "🟡 No live proxies found in scan results"
+            echo "🟡 No live proxies found in current scan results"
           fi
 
           # Fallback to cached IP if no new IP found
           if [ -z "${BEST_IP}" ] && [ -f "${CACHE_FILE}" ]; then
-            echo "🔁 Attempting to use cached IP..."
+            echo "🔁 Attempting to use cached IP as fallback..."
             CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
             
             if [[ "$CACHED_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-              BEST_IP="$CACHED_IP"
-              echo "✅ Using cached IP: $BEST_IP"
+              # Validate each octet is 0-255
+              IFS='.' read -ra OCTETS <<< "$CACHED_IP"
+              VALID=true
+              for octet in "${OCTETS[@]}"; do
+                if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+                  VALID=false
+                  break
+                fi
+              done
+              
+              if [ "$VALID" = true ]; then
+                BEST_IP="$CACHED_IP"
+                echo "✅ Using cached IP: $BEST_IP"
+              else
+                echo "⚠️ Cached IP has invalid octets: ${CACHED_IP}"
+              fi
             else
               echo "⚠️ Cache contains invalid IP format: ${CACHED_IP}"
             fi
@@ -210,17 +227,26 @@ jobs:
 
           # Validate we have a valid IP
           if [ -z "${BEST_IP}" ]; then
-            echo "❌ FATAL: No valid IP available"
-            echo "=> Scan log preview (last 100 lines):"
-            tail -n 100 "$LOG" || true
+            echo "❌ FATAL: No valid IP available from scan or cache"
+            echo "=> Scan log preview (last 150 lines):"
+            tail -n 150 "$LOG" || true
             exit 1
           fi
 
-          # Final IP format validation
+          # Final comprehensive IP validation
           if ! [[ "$BEST_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
             echo "❌ FATAL: Invalid IP format: $BEST_IP"
             exit 1
           fi
+
+          # Validate octets are within range
+          IFS='.' read -ra FINAL_OCTETS <<< "$BEST_IP"
+          for octet in "${FINAL_OCTETS[@]}"; do
+            if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+              echo "❌ FATAL: IP octet out of range: $BEST_IP"
+              exit 1
+            fi
+          done
 
           # Save to cache for future runs
           echo "💾 Saving best IP to cache"
@@ -231,9 +257,9 @@ jobs:
 
           # Set output for next steps
           echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
-          echo "✅ Scanner step completed"
+          echo "✅ Scanner step completed successfully"
           echo "=> Selected IP: ${BEST_IP}"
-          [ -n "${BEST_LATENCY}" ] && echo "=> Latency: ${BEST_LATENCY}ms"
+          [ -n "${BEST_LATENCY}" ] && echo "=> Latency: ${BEST_LATENCY}ms (lowest ping)"
           echo "=== Scanner execution ended ==="
 
       - name: Upload scan.log for debugging (always)
@@ -299,8 +325,7 @@ jobs:
               # Cloudflare KV REST API endpoint
               local api_url="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_VAR_KEY}"
               
-              echo "   URL:"
-              echo "   ${api_url}"
+              echo "   URL: ${api_url}"
               
               local temp_response
               temp_response=$(mktemp)
@@ -339,61 +364,82 @@ jobs:
                 echo ""
               fi
               
-              # Specific error code handling
+              # Specific error code handling with detailed guidance
               case "$http_code" in
                 000)
                   echo "   • Network error or timeout occurred"
                   ;;
                 401)
                   echo "❌ FATAL: Unauthorized - CF_API_TOKEN is invalid"
-                  echo "=> Please verify:"
-                  echo "   1. CF_API_TOKEN is correctly set in GitHub secrets"
-                  echo "   2. Token has not expired"
-                  echo "   3. Token has 'Account.Workers KV Storage:Edit' permission"
+                  echo "=> Solution steps:"
+                  echo "   1. Go to https://dash.cloudflare.com/profile/api-tokens"
+                  echo "   2. Create a new API Token"
+                  echo "   3. Add permission: Account → Workers KV Storage → Edit"
+                  echo "   4. Update CF_API_TOKEN secret in GitHub repository settings"
                   return 1
                   ;;
                 403)
                   echo "❌ FATAL: Forbidden - insufficient permissions"
-                  echo "=> Please verify:"
-                  echo "   1. CF_API_TOKEN has 'Account.Workers KV Storage:Edit' permission"
-                  echo "   2. Token has access to the specified account"
-                  echo "   3. KV namespace is not bound to a worker (this blocks API access)"
+                  echo "=> Solution steps:"
+                  echo "   1. Verify API Token has 'Workers KV Storage:Edit' permission"
+                  echo "   2. Check token has access to the specified account"
+                  echo "   3. Important: KV namespace must NOT be bound to a Worker"
+                  echo "   4. If bound, temporarily unbind in wrangler.toml:"
+                  echo "      Comment out kv_namespaces bindings section"
                   return 1
                   ;;
                 404)
                   echo "❌ FATAL: Not Found - resource does not exist"
-                  echo "=> Please verify:"
-                  echo "   1. CF_ACCOUNT_ID is correct"
-                  echo "   2. CF_KV_NAMESPACE_ID exists (check: wrangler kv:namespace list)"
-                  echo "   3. Namespace is accessible from your account"
+                  echo "=> Solution steps:"
+                  echo "   1. Verify CF_ACCOUNT_ID is correct (check Cloudflare dashboard URL)"
+                  echo "   2. Run: wrangler kv:namespace list"
+                  echo "   3. Confirm CF_KV_NAMESPACE_ID exists and matches"
+                  echo "   4. Ensure namespace is in the correct account"
                   return 1
                   ;;
                 405)
-                  echo "❌ FATAL: Method Not Allowed - API endpoint issue"
-                  echo "=> This error means PUT is not allowed for this authentication scheme"
-                  echo "=> Please verify:"
-                  echo "   1. CF_API_TOKEN (not API Key) is being used"
-                  echo "   2. KV namespace is NOT bound to a worker"
-                  echo "   3. Using correct API endpoint format"
+                  echo "❌ FATAL: Method Not Allowed - API endpoint configuration issue"
                   echo ""
-                  echo "   To fix this issue:"
-                  echo "   - If KV is bound to a worker, unbind it first"
-                  echo "   - Ensure you're using an API Token (not API Key + Email)"
-                  echo "   - Generate a new API Token with 'Workers KV Storage:Edit' permission"
+                  echo "=== This is the main error you're experiencing ==="
+                  echo ""
+                  echo "Root cause: The KV namespace is bound to a Worker,"
+                  echo "which blocks direct API PUT requests."
+                  echo ""
+                  echo "=> SOLUTION (choose one approach):"
+                  echo ""
+                  echo "Option A - Unbind KV from Worker (Recommended):"
+                  echo "   1. Edit your wrangler.toml file"
+                  echo "   2. Find the [[kv_namespaces]] section"
+                  echo "   3. Comment it out or remove the binding:"
+                  echo "      # [[kv_namespaces]]"
+                  echo "      # binding = \"KV\""
+                  echo "      # id = \"your-namespace-id\""
+                  echo "   4. Deploy worker: wrangler deploy"
+                  echo "   5. Re-run this workflow"
+                  echo ""
+                  echo "Option B - Use Workers API instead:"
+                  echo "   1. Create a Worker endpoint that accepts PUT requests"
+                  echo "   2. Have the Worker update KV internally"
+                  echo "   3. Call the Worker endpoint from this workflow"
+                  echo ""
+                  echo "Option C - Use wrangler CLI:"
+                  echo "   Install wrangler in the workflow and use:"
+                  echo "   wrangler kv:key put --binding=KV KEY VALUE"
+                  echo ""
                   return 1
                   ;;
                 429)
-                  echo "   • Rate limited - will retry with backoff"
+                  echo "   • Rate limited - will retry with exponential backoff"
                   ;;
                 500|502|503|504)
-                  echo "   • Cloudflare server error - will retry"
+                  echo "   • Cloudflare server error - transient issue, will retry"
                   ;;
                 *)
-                  echo "   • Unexpected error code"
+                  echo "   • Unexpected error code: ${http_code}"
                   ;;
               esac
               
-              # Retry with exponential backoff
+              # Retry with exponential backoff (except for fatal errors)
               if [ "$attempt" -lt "$max_attempts" ]; then
                 local sleep_duration=$((base_sleep_time * attempt))
                 echo "   • Waiting ${sleep_duration}s before retry..."
@@ -404,7 +450,7 @@ jobs:
             done
             
             echo ""
-            echo "❌ All retry attempts exhausted"
+            echo "❌ All retry attempts exhausted after ${max_attempts} tries"
             return 1
           }
 
@@ -413,29 +459,17 @@ jobs:
             echo ""
             echo "❌ FATAL: Failed to update Cloudflare KV after all retries"
             echo ""
-            echo "=== Troubleshooting Guide ==="
+            echo "=== Quick Fix Guide ==="
             echo ""
-            echo "1. Verify CF_API_TOKEN has 'Account.Workers KV Storage:Edit' permission"
-            echo "   → Go to: https://dash.cloudflare.com/profile/api-tokens"
-            echo "   → Create/Edit token → Add permission → Account → Workers KV Storage → Edit"
+            echo "Most likely issue: KV namespace is bound to a Worker"
             echo ""
-            echo "2. Confirm CF_ACCOUNT_ID matches your Cloudflare account"
-            echo "   → Check at: https://dash.cloudflare.com/ (in URL after /accounts/)"
+            echo "Quick fix:"
+            echo "  1. Edit wrangler.toml in your repository"
+            echo "  2. Remove or comment out the kv_namespaces binding"
+            echo "  3. Commit and push changes"
+            echo "  4. Re-run this workflow"
             echo ""
-            echo "3. Check CF_KV_NAMESPACE_ID exists: wrangler kv:namespace list"
-            echo "   → Run: wrangler kv:namespace list"
-            echo "   → Verify the namespace ID matches"
-            echo ""
-            echo "4. Ensure KV namespace is NOT bound to a worker (unbind if necessary)"
-            echo "   → Check wrangler.toml for kv_namespaces bindings"
-            echo "   → Temporarily remove binding to allow direct API access"
-            echo ""
-            echo "5. Test manually with curl:"
-            echo "   curl -X PUT \\"
-            echo "     'https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/storage/kv/namespaces/YOUR_NAMESPACE_ID/values/YOUR_KEY' \\"
-            echo "     -H 'Authorization: Bearer YOUR_API_TOKEN' \\"
-            echo "     -H 'Content-Type: text/plain' \\"
-            echo "     --data 'test_value'"
+            echo "For detailed troubleshooting, see the logs above."
             echo ""
             exit 1
           fi
@@ -446,7 +480,7 @@ jobs:
           # Perform health check if worker name is provided
           if [ -n "${CF_WORKER_NAME}" ]; then
             echo ""
-            echo "=> Performing health check..."
+            echo "=> Performing Worker health check..."
             HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
             echo "   • Health check URL: ${HEALTH_URL}"
             
@@ -465,13 +499,17 @@ jobs:
               echo "   • HTTP Status: ${http_status}"
               
               if [ "$http_status" = "200" ]; then
-                echo "✅ Health check passed"
+                echo "✅ Health check passed - Worker is responding correctly"
                 health_check_passed=true
                 break
               elif [ "$http_status" = "404" ]; then
-                echo "⚠️ Health endpoint not found (might not be implemented)"
+                echo "ℹ️ Health endpoint not found (this is normal if not implemented)"
                 health_check_passed=true
                 break
+              elif [ "$http_status" = "000" ]; then
+                echo "⚠️ Could not connect to Worker"
+              else
+                echo "⚠️ Unexpected status code: ${http_status}"
               fi
               
               if [ "$health_attempt" -lt "$max_health_checks" ]; then
@@ -482,16 +520,18 @@ jobs:
 
             if [ "$health_check_passed" = "false" ]; then
               echo ""
-              echo "⚠️ WARNING: Health check inconclusive, but KV was updated to: ${BESTIP}"
-              echo "=> Please verify your Worker manually"
+              echo "⚠️ WARNING: Health check failed, but KV was updated to: ${BESTIP}"
+              echo "=> Please verify your Worker deployment manually"
+              echo "=> Visit: https://${CF_WORKER_NAME}.workers.dev"
             fi
           else
-            echo "=> Skipping health check (CF_WORKER_NAME not set)"
+            echo "=> Skipping health check (CF_WORKER_NAME not configured)"
           fi
           
           echo ""
           echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
           echo "✅ Cloudflare KV update completed successfully"
+          echo "=> Final IP: ${BESTIP}"
           echo "=> End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=== Cloudflare KV update ended ==="
 
@@ -503,8 +543,8 @@ jobs:
     steps:
       - name: Cache maintenance completed
         run: |
-          echo "Post job cleanup."
-          echo "Cache artifacts have been preserved for future runs"
+          echo "Post job cleanup completed."
+          echo "Rust artifacts and registry cache preserved for future runs"
 
   post-restore-ip-cache:
     name: Post Restore Best IP Cache
@@ -514,9 +554,8 @@ jobs:
     steps:
       - name: IP cache status
         run: |
-          echo "Post job cleanup."
-          echo "IP cache restoration completed"
-          echo "Best IP has been saved for subsequent workflow runs"
+          echo "Post job cleanup completed."
+          echo "Best IP cache has been updated for subsequent workflow runs"
 
   cleanup-runs:
     name: Post Checkout repository (full)
@@ -547,7 +586,7 @@ jobs:
       - name: Workflow execution summary
         run: |
           echo "=== Workflow Execution Summary ==="
-          echo "=> Best IP selected: ${{ needs.update-proxy-variable.outputs.bestip }}"
+          echo "=> Best IP selected (lowest latency): ${{ needs.update-proxy-variable.outputs.bestip }}"
           echo "=> Execution completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=> Status: Complete"
-          echo "=> All steps have been executed successfully"
+          echo "=> All steps executed successfully"
