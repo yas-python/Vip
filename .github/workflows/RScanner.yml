@@ -44,7 +44,7 @@ jobs:
           echo "=> Updating package lists..."
           sudo apt-get update -y
           echo "=> Installing required packages..."
-          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates
+          sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
 
       - name: Restore Best IP Cache
         uses: actions/cache@v4
@@ -167,7 +167,16 @@ jobs:
                 print latency, ip
               }
             }
-          ' "$LOG" | sort -n -k1,1 | head -n 20 > candidates.txt
+          ' "$LOG" > unsorted_candidates.txt
+          
+          if [ -s unsorted_candidates.txt ]; then
+            sort -n -k1,1 unsorted_candidates.txt 2>/dev/null | head -n 20 > candidates.txt || {
+              echo "⚠️ Sort command failed, using unsorted data"
+              head -n 20 unsorted_candidates.txt > candidates.txt
+            }
+          else
+            touch candidates.txt
+          fi
 
           CANDIDATES_COUNT=$(wc -l < candidates.txt)
           echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
@@ -304,42 +313,65 @@ jobs:
               
               local api_url="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${CF_VAR_KEY}"
               
-              local response
-              response=$(curl -s -w "\n%{http_code}" -X PUT \
+              local temp_response
+              temp_response=$(mktemp)
+              
+              local http_code
+              http_code=$(curl -s -w "%{http_code}" -X PUT \
                 "$api_url" \
                 -H "Authorization: Bearer ${CF_API_TOKEN}" \
                 -H "Content-Type: text/plain" \
-                --data-binary "${BESTIP}" \
+                --data "${BESTIP}" \
                 --max-time 30 \
-                --connect-timeout 10 2>&1) || response="000"
+                --connect-timeout 10 \
+                -o "$temp_response" 2>&1 || echo "000")
               
-              local http_code
-              http_code=$(echo "$response" | tail -n1)
               local body
-              body=$(echo "$response" | sed '$d')
+              body=$(cat "$temp_response" 2>/dev/null || echo "")
+              rm -f "$temp_response"
               
               echo "   • HTTP Status: ${http_code}"
               
               if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
                 echo "✅ KV PUT successful"
-                [ -n "$body" ] && echo "   • Response: $body"
+                if [ -n "$body" ]; then
+                  if echo "$body" | jq -e '.success' >/dev/null 2>&1; then
+                    echo "   • Response confirmed successful"
+                  else
+                    echo "   • Response: $(echo "$body" | head -c 200)"
+                  fi
+                fi
                 return 0
               fi
               
               echo "⚠️ KV PUT failed (HTTP ${http_code})"
-              [ -n "$body" ] && echo "   • Error: $(echo "$body" | head -c 500)"
+              if [ -n "$body" ]; then
+                echo "   • Response body: $(echo "$body" | head -c 500)"
+              fi
               
               case "$http_code" in
                 401|403)
-                  echo "❌ Authentication error - verify CF_API_TOKEN"
+                  echo "❌ Authentication error - checking token permissions..."
+                  echo "   Required permissions: Account.Workers KV Storage:Edit"
                   return 1
                   ;;
                 404)
-                  echo "❌ Resource not found - verify CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID"
+                  echo "❌ Resource not found - verifying configuration..."
+                  echo "   • Account ID: ${CF_ACCOUNT_ID}"
+                  echo "   • Namespace ID: ${CF_KV_NAMESPACE_ID}"
                   return 1
                   ;;
-                429|503|504)
-                  echo "   • Temporary error, will retry"
+                405)
+                  echo "❌ Method not allowed - this suggests API endpoint issue"
+                  echo "   • Current endpoint: $api_url"
+                  echo "   • Verify that KV namespace exists and is not bound to a worker"
+                  return 1
+                  ;;
+                429)
+                  echo "   • Rate limited, will retry with exponential backoff"
+                  ;;
+                503|504)
+                  echo "   • Service temporarily unavailable, will retry"
                   ;;
               esac
               
@@ -358,10 +390,12 @@ jobs:
           if ! retry_kv_put; then
             echo ""
             echo "❌ FATAL: KV update failed after all retries"
-            echo "=> Verify your Cloudflare configuration:"
-            echo "   1. CF_API_TOKEN has 'Edit Cloudflare Workers' permission"
-            echo "   2. CF_ACCOUNT_ID is correct"
-            echo "   3. CF_KV_NAMESPACE_ID exists and is accessible"
+            echo "=> Troubleshooting steps:"
+            echo "   1. Verify CF_API_TOKEN has 'Account.Workers KV Storage:Edit' permission"
+            echo "   2. Confirm CF_ACCOUNT_ID matches your Cloudflare account"
+            echo "   3. Check CF_KV_NAMESPACE_ID exists: wrangler kv:namespace list"
+            echo "   4. Ensure KV namespace is NOT bound to a worker (unbind if necessary)"
+            echo "   5. Test manually: curl -X PUT https://api.cloudflare.com/client/v4/accounts/\$CF_ACCOUNT_ID/storage/kv/namespaces/\$CF_KV_NAMESPACE_ID/values/\$KEY -H 'Authorization: Bearer \$TOKEN' -d 'test'"
             exit 1
           fi
 
@@ -369,45 +403,49 @@ jobs:
           echo "✅ KV updated successfully: ${BESTIP}"
           echo "=> Performing health check..."
 
-          HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
-          echo "=> Health check URL: ${HEALTH_URL}"
-          
-          health_check_passed=false
-          max_health_checks=5
-          
-          for health_attempt in $(seq 1 $max_health_checks); do
-            echo ""
-            echo "→ Health check ${health_attempt}/${max_health_checks}"
+          if [ -n "${CF_WORKER_NAME}" ]; then
+            HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
+            echo "=> Health check URL: ${HEALTH_URL}"
             
-            http_status=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 10 \
-              --connect-timeout 5 \
-              "${HEALTH_URL}" 2>/dev/null || echo "000")
+            health_check_passed=false
+            max_health_checks=5
             
-            echo "   • HTTP Status: ${http_status}"
-            
-            if [ "$http_status" = "200" ]; then
-              echo "✅ Health check passed"
-              health_check_passed=true
-              break
-            elif [ "$http_status" = "404" ]; then
-              echo "⚠️ Health endpoint not found (might not be implemented)"
-              health_check_passed=true
-              break
-            fi
-            
-            if [ "$health_attempt" -lt "$max_health_checks" ]; then
-              echo "   • Waiting 3s..."
-              sleep 3
-            fi
-          done
+            for health_attempt in $(seq 1 $max_health_checks); do
+              echo ""
+              echo "→ Health check ${health_attempt}/${max_health_checks}"
+              
+              http_status=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 10 \
+                --connect-timeout 5 \
+                "${HEALTH_URL}" 2>/dev/null || echo "000")
+              
+              echo "   • HTTP Status: ${http_status}"
+              
+              if [ "$http_status" = "200" ]; then
+                echo "✅ Health check passed"
+                health_check_passed=true
+                break
+              elif [ "$http_status" = "404" ]; then
+                echo "⚠️ Health endpoint not found (might not be implemented)"
+                health_check_passed=true
+                break
+              fi
+              
+              if [ "$health_attempt" -lt "$max_health_checks" ]; then
+                echo "   • Waiting 3s..."
+                sleep 3
+              fi
+            done
 
-          echo ""
-          if [ "$health_check_passed" = "true" ]; then
-            echo "✅ Cloudflare KV update completed successfully"
+            echo ""
+            if [ "$health_check_passed" = "true" ]; then
+              echo "✅ Cloudflare KV update completed successfully"
+            else
+              echo "⚠️ WARNING: Health check inconclusive, but KV was updated to: ${BESTIP}"
+              echo "=> Please verify your Worker manually"
+            fi
           else
-            echo "⚠️ WARNING: Health check failed, but KV was updated to: ${BESTIP}"
-            echo "=> Please verify your Worker manually"
+            echo "=> Skipping health check (CF_WORKER_NAME not set)"
           fi
           
           echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
