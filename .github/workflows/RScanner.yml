@@ -201,7 +201,6 @@ jobs:
                 fi
               done
               
-              # *** FIX #1: Corrected syntax here (removed 'end') ***
               if [ "$VALID" = true ]; then
                 BEST_IP="$CACHED_IP"
                 echo "✅ Using cached IP: $BEST_IP"
@@ -246,6 +245,11 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
       
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # Use a current LTS version
+
       - name: Install Wrangler CLI
         run: |
           set -euo pipefail
@@ -257,8 +261,10 @@ jobs:
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }} # API Token needs to be in env for wrangler
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }} # Account ID needs to be in env for wrangler
+          # Use new env var names for Wrangler, mapped from your old secrets
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }} 
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          # Keep other variables as they are
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
@@ -268,7 +274,8 @@ jobs:
           
           echo "=== Cloudflare KV update (Wrangler) started ==="
           
-          for required_var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
+          # Check for the new variable names
+          for required_var in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
               echo "❌ ERROR: ${required_var} is not set"
               exit 1
@@ -289,6 +296,9 @@ jobs:
           
           if [ $WRANGLER_EXIT_CODE -ne 0 ]; then
             echo "❌ FATAL: Wrangler command failed with exit code $WRANGLER_EXIT_CODE"
+            # Dump wrangler log for debugging
+            echo "=> Dumping wrangler log:"
+            cat /home/runner/.config/wrangler/logs/wrangler-*.log 2>/dev/null || echo "No log file found."
             exit 1
           fi
           
@@ -298,8 +308,6 @@ jobs:
           if [ -n "${CF_WORKER_NAME}" ]; then
             echo "=> Performing Worker health check..."
             HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
-            
-            # ... (Health check logic) ...
             
             health_check_passed=false
             max_health_checks=3
