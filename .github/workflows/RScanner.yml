@@ -95,7 +95,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run scanner and select best IP
+      - name: Run scanner and select best IP (Lowest Ping)
         id: scan
         timeout-minutes: 15
         run: |
@@ -144,13 +144,12 @@ jobs:
       
           echo "🔍 Parsing results for live proxies..."
                 
-          # Extract IP addresses and latencies - looking for patterns like:
-          # "PROXY LIVE ✅: 20.63.17.53 (1615ms)" or similar formats
+          # Extracts IP and Latency, then reformats to "Latency IP"
           grep -iE "(PROXY[[:space:]]+LIVE|selected.*IP|best.*IP)" "$LOG" | \
             grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
             sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
             awk '{
-              # Validate IP format (each octet must be 0-255)
+              # Validate IP and Latency
               split($2, octets, ".")
               if (length(octets) == 4) {
                 valid = 1
@@ -169,6 +168,7 @@ jobs:
                 
           # Sort by latency numerically (lowest ping first) and take top 20
           if [ -s unsorted_candidates.txt ]; then
+            # *** The key step to ensure lowest ping is selected: 'sort -n -k1,1' ***
             sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || {
               echo "⚠️ Sort command failed, using unsorted data"
               head -n 20 unsorted_candidates.txt > candidates.txt
@@ -211,7 +211,7 @@ jobs:
                 if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
                   VALID=false
                   break
-                fi
+                end
               done
                     
               if [ "$VALID" = true ]; then
@@ -282,10 +282,10 @@ jobs:
       
       # =================================================================
       #
-      #   *** FIX APPLIED HERE ***
-      #   Replaced the broken 'curl | bash' script with the official,
-      #   robust, and maintained Cloudflare Wrangler Action.
-      #   This action installs Wrangler and handles authentication.
+      #   *** FIX APPLIED HERE: Added 'command: whoami' ***
+      #   This prevents 'cloudflare/wrangler-action' from failing the step 
+      #   by attempting an unnecessary 'deploy' or 'publish' command. 
+      #   It now only installs Wrangler and sets up authentication.
       #
       # =================================================================
 
@@ -296,24 +296,19 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           # This sets the default account ID for subsequent commands
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # *** FIX ***
-          # Added a no-op command ('whoami') to prevent the action
-          # from running its default command ('wrangler deploy' or 'publish').
-          # This step will now *only* install and authenticate Wrangler.
-          command: whoami
+          # *** FIX ***: Prevents deployment error, only installs Wrangler
+          command: whoami 
 
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
-          # Auth secrets (CF_API_TOKEN, CF_ACCOUNT_ID) are no longer needed here.
-          # The 'cloudflare/wrangler-action' step above already configured them.
+          # Wrangler is now installed and authenticated from the previous step
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
           BESTIP: ${{ steps.scan.outputs.bestip }}
         run: |
           set -euo pipefail
-          # No 'export CLOUDFLARE_API_TOKEN' needed.
           
           echo "=== Cloudflare KV update (Wrangler) started ==="
           echo "=> Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -336,8 +331,7 @@ jobs:
           echo "🚀 Attempting to update KV value..."
           
           set +e
-          # The command is now simpler: --account-id is not needed
-          # because the Wrangler Action already set it as default.
+          # Command now works because 'wrangler' is correctly installed in the PATH
           wrangler kv:key put \
             --namespace-id "${CF_KV_NAMESPACE_ID}" \
             "${CF_VAR_KEY}" \
@@ -405,7 +399,7 @@ jobs:
             fi
           else
             echo "=> Skipping health check (CF_WORKER_NAME not configured)"
-          fi
+          end
           # --- End Health Check ---
                   
           echo ""
