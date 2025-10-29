@@ -286,8 +286,8 @@ jobs:
           
           set +e
           
-          # *** THIS IS THE FIX: Use "kv:key put" not "kv namespace put" ***
-          wrangler kv:key put \
+          # *** THIS IS THE FIX: Use "kv key put" (space) not "kv:key put" (colon) ***
+          wrangler kv key put \
             "${CF_VAR_KEY}" \
             "${BESTIP}" \
             --namespace-id "${CF_KV_NAMESPACE_ID}"
