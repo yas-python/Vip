@@ -286,8 +286,8 @@ jobs:
           
           set +e
           
-          # *** FIX: The argument must be --namespace-id (with a dash) ***
-          wrangler kv namespace put \
+          # *** THIS IS THE FIX: Use "kv:key put" not "kv namespace put" ***
+          wrangler kv:key put \
             "${CF_VAR_KEY}" \
             "${BESTIP}" \
             --namespace-id "${CF_KV_NAMESPACE_ID}"
