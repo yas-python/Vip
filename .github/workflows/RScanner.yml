@@ -1,4 +1,4 @@
-Name: Rust Proxy Scanner (Ultimate) - KV Update
+name: Rust Proxy Scanner (Ultimate) - KV Update
 
 on:
   workflow_dispatch:
@@ -283,8 +283,9 @@ jobs:
       # =================================================================
       #
       #   *** FIX APPLIED HERE ***
-      #   Using the official Cloudflare Wrangler Action to fix 
-      #   the 'npx' or 'curl' installation errors.
+      #   Replaced the broken 'curl | bash' script with the official,
+      #   robust, and maintained Cloudflare Wrangler Action.
+      #   This action installs Wrangler and handles authentication.
       #
       # =================================================================
 
@@ -295,6 +296,11 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           # This sets the default account ID for subsequent commands
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          # *** FIX ***
+          # Added a no-op command ('whoami') to prevent the action
+          # from running its default command ('wrangler deploy' or 'publish').
+          # This step will now *only* install and authenticate Wrangler.
+          command: whoami
 
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
@@ -354,7 +360,7 @@ jobs:
           if [ -n "${CF_WORKER_NAME}" ]; then
             echo ""
             echo "=> Performing Worker health check..."
-            HEALTH_URL="https://worker.${CF_WORKER_NAME}.workers.dev/health"
+            HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
             echo "   • Health check URL: ${HEALTH_URL}"
                   
             health_check_passed=false
@@ -395,7 +401,7 @@ jobs:
               echo ""
               echo "⚠️ WARNING: Health check failed, but KV was updated to: ${BESTIP}"
               echo "=> Please verify your Worker deployment manually"
-              echo "=> Visit: https://worker.${CF_WORKER_NAME}.workers.dev"
+              echo "=> Visit: https://${CF_WORKER_NAME}.workers.dev"
             fi
           else
             echo "=> Skipping health check (CF_WORKER_NAME not configured)"
