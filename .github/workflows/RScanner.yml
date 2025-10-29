@@ -246,16 +246,19 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
       
-      - name: Setup Wrangler CLI (Official Action)
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: whoami # Just installs and auths, no deployment
+      - name: Install Wrangler CLI
+        run: |
+          set -euo pipefail
+          echo "=> Installing Wrangler CLI using npm..."
+          npm install -g wrangler
+          echo "=> Wrangler version check:"
+          wrangler --version
 
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }} # API Token needs to be in env for wrangler
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }} # Account ID needs to be in env for wrangler
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
@@ -265,7 +268,7 @@ jobs:
           
           echo "=== Cloudflare KV update (Wrangler) started ==="
           
-          for required_var in CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
+          for required_var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
               echo "❌ ERROR: ${required_var} is not set"
               exit 1
@@ -275,8 +278,8 @@ jobs:
           echo "🚀 Attempting to update KV value: ${BESTIP}"
           
           set +e
-          # *** FIX #2: Changed 'wrangler' to 'npx wrangler' to find the command ***
-          npx wrangler kv:key put \
+          # Using the globally installed wrangler (not npx)
+          wrangler kv:key put \
             --namespace-id "${CF_KV_NAMESPACE_ID}" \
             "${CF_VAR_KEY}" \
             "${BESTIP}"
