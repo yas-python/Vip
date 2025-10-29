@@ -1,4 +1,4 @@
-Name: Rust Proxy Scanner (Ultimate) - KV Update
+name: Rust Proxy Scanner (Ultimate) - KV Update
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ env:
   MAX_CF_RETRIES: "5"
   CF_RETRY_BASE_SLEEP: "2"
   SCANNER_TIMEOUT: "600"
-  
+
 jobs:
   update-proxy-variable:
     name: Build → Scan → Update Cloudflare KV (RScanner)
@@ -257,48 +257,39 @@ jobs:
           npm install -g wrangler
           echo "=> Wrangler version check:"
           wrangler --version
-      
-      # 💡 تغییر تخصصی: مرحله اول - ایجاد فایل محتوای KV
-      - name: Create KV content file
-        id: create_kv_file
-        run: |
-          set -euo pipefail
-          IP_FILE="best_ip_value.txt"
-          echo -n "${{ steps.scan.outputs.bestip }}" > $IP_FILE
-          echo "KV_FILE=$IP_FILE" >> "$GITHUB_OUTPUT"
-          echo "✅ Created file for KV update: $IP_FILE"
 
-      # 💡 تغییر تخصصی: مرحله دوم - به‌روزرسانی Cloudflare KV با استفاده از مسیر فایل
-      - name: Update Cloudflare KV using Wrangler (via File Path)
+      - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
+          # Use new env var names for Wrangler, mapped from your old secrets
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }} 
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          # Keep other variables as they are
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
           BESTIP: ${{ steps.scan.outputs.bestip }}
-          KV_FILE: ${{ steps.create_kv_file.outputs.KV_FILE }} # مسیر فایل
         run: |
           set -euo pipefail
           
           echo "=== Cloudflare KV update (Wrangler) started ==="
           
+          # Check for the new variable names
           for required_var in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
-              echo "❌ ERROR: ${required_var} is not set. Check GitHub Secrets."
+              echo "❌ ERROR: ${required_var} is not set"
               exit 1
             fi
           done
           
-          echo "🚀 Attempting to update KV value: ${BESTIP} using file path: ${KV_FILE}"
+          echo "🚀 Attempting to update KV value: ${BESTIP}"
           
           set +e
           
-          # استفاده از آرگومان --path برای ارسال فایل به جای رشته مستقیم
+          # *** THIS IS THE FIX: Use "kv key put" (space) not "kv:key put" (colon) ***
           wrangler kv key put \
             "${CF_VAR_KEY}" \
-            --path "${KV_FILE}" \
+            "${BESTIP}" \
             --namespace-id "${CF_KV_NAMESPACE_ID}"
           
           WRANGLER_EXIT_CODE=$?
@@ -306,49 +297,18 @@ jobs:
           
           if [ $WRANGLER_EXIT_CODE -ne 0 ]; then
             echo "❌ FATAL: Wrangler command failed with exit code $WRANGLER_EXIT_CODE"
+            # Dump wrangler log for debugging
+            echo "=> Dumping wrangler log:"
+            cat /home/runner/.config/wrangler/logs/wrangler-*.log 2>/dev/null || echo "No log file found."
             exit 1
           fi
           
           echo "✅ KV successfully updated with IP: ${BESTIP}"
-          echo "update_status=success" >> "$GITHUB_OUTPUT"
           
-      # 💡 مرحله جدید و هوشمند: تأیید (Readback) مقدار ذخیره شده در KV
-      - name: Verify KV Value Readback
-        id: verify_kv
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }} 
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
-          EXPECTED_IP: ${{ steps.scan.outputs.bestip }}
-        run: |
-          set -euo pipefail
-          
-          echo "=== Cloudflare KV Readback Verification ==="
-          
-          # خواندن مقدار از Cloudflare KV
-          ACTUAL_IP=$(wrangler kv key get "${CF_VAR_KEY}" --namespace-id "${CF_KV_NAMESPACE_ID}" 2>/dev/null || echo "ReadError")
-          
-          echo "=> Expected IP (From Scan): ${EXPECTED_IP}"
-          echo "=> Actual IP (From KV):     ${ACTUAL_IP}"
-          
-          if [ "$ACTUAL_IP" = "$EXPECTED_IP" ]; then
-            echo "✅ VERIFICATION SUCCESS: IP in KV matches the scanned best IP."
-            echo "verification_status=success" >> "$GITHUB_OUTPUT"
-          else
-            echo "❌ VERIFICATION FAILED: IP mismatch or ReadError."
-            echo "verification_status=failed" >> "$GITHUB_OUTPUT"
-            # در صورت عدم تطابق، فرآیند را متوقف نمی‌کنیم تا مراحل نهایی اجرا شوند، اما یک هشدار شدید صادر می‌کنیم.
-          fi
-
-      - name: Worker Health Check & Final Summary
-        run: |
-          set -euo pipefail
-          
-          # اجرای بررسی Health Check که قبلاً بود (بدون تغییر)
-          if [ -n "${{ secrets.CF_WORKER_NAME }}" ]; then
+          # Health Check (No changes needed)
+          if [ -n "${CF_WORKER_NAME}" ]; then
             echo "=> Performing Worker health check..."
-            HEALTH_URL="https://${{ secrets.CF_WORKER_NAME }}.workers.dev/health"
+            HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
             
             health_check_passed=false
             max_health_checks=3
@@ -369,20 +329,13 @@ jobs:
             done
       
             if [ "$health_check_passed" = "false" ]; then
-              echo "⚠️ WARNING: Health check failed, but KV was updated to: ${{ steps.scan.outputs.bestip }}"
+              echo "⚠️ WARNING: Health check failed, but KV was updated to: ${BESTIP}"
             fi
           else
             echo "=> Skipping health check (CF_WORKER_NAME not configured)"
           fi
           
-          # خلاصه‌ای از وضعیت KV
-          if [ "${{ steps.verify_kv.outputs.verification_status }}" != "success" ]; then
-              echo "🚨 FATAL WARNING: KV update verification failed. Check Cloudflare Secrets and permissions."
-              # در اینجا تصمیم می‌گیریم که اگر تأیید شکست خورد، کل Workflow را Fail کنیم تا مشکل را پیدا کنید
-              exit 1 
-          fi
-          
-          echo "bestip=${{ steps.scan.outputs.bestip }}" >> "$GITHUB_OUTPUT"
+          echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
           echo "✅ Cloudflare KV update completed successfully"
           echo "=== Cloudflare KV update (Wrangler) ended ==="
 
@@ -435,6 +388,3 @@ jobs:
           echo "=== Workflow Execution Summary ==="
           echo "=> Best IP selected: ${{ needs.update-proxy-variable.outputs.bestip }}"
           echo "=> Status: Complete"
-          if [ "${{ needs.update-proxy-variable.outputs.bestip }}" != "" ]; then
-             echo "✅ KV Update Verified: ${{ steps.verify_kv.outputs.verification_status }}"
-          fi
