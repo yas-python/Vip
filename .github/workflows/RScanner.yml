@@ -285,8 +285,11 @@ jobs:
           set -euo pipefail
           echo "=> Installing Wrangler v3..."
           
-          # Add retry logic for curl to handle temporary DNS failures (Error 6)
-          curl -sSL --retry 3 --retry-delay 5 "https://get.wrangler.dev" | bash
+          #
+          # *** FIX APPLIED HERE ***
+          # Bypassing the failing 'get.wrangler.dev' DNS by using the direct script URL.
+          #
+          curl -sSL --retry 3 --retry-delay 5 "https://raw.githubusercontent.com/cloudflare/wrangler-action/v3.0.0/scripts/install-wrangler.sh" | bash
           
           # Add wrangler to the GITHUB_PATH for subsequent steps
           echo "$HOME/.wrangler/bin" >> $GITHUB_PATH
