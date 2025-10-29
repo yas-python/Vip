@@ -144,8 +144,7 @@ jobs:
       
           echo "🔍 Parsing results for live proxies..."
                 
-          # (This logic is correct for 'PROXY LIVE : IP (XXX ms)' format)
-          # Extracts IP and Latency, then reformats to "Latency IP"
+          # This logic correctly parses "PROXY LIVE : IP (XXX ms)"
           grep -iE "(PROXY[[:space:]]+LIVE|selected.*IP|best.*IP)" "$LOG" | \
             grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
             sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
@@ -167,9 +166,9 @@ jobs:
               }
             }' > unsorted_candidates.txt || touch unsorted_candidates.txt
                 
-          # Sort by latency numerically (lowest ping first) and take top 20
+          # Sort by latency numerically (lowest ping first)
           if [ -s unsorted_candidates.txt ]; then
-            # *** The key step to ensure lowest ping is selected: 'sort -n -k1,1' ***
+            # *** This 'sort -n' ensures the LOWEST ping is selected ***
             sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || {
               echo "⚠️ Sort command failed, using unsorted data"
               head -n 20 unsorted_candidates.txt > candidates.txt
@@ -191,7 +190,7 @@ jobs:
           BEST_IP=""
           BEST_LATENCY=""
       
-          # Select the IP with the LOWEST latency (first line after numerical sort)
+          # Select the IP with the LOWEST latency (first line after sort)
           if [ -s candidates.txt ]; then
             read -r BEST_LATENCY BEST_IP < candidates.txt
             echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms latency"
@@ -205,14 +204,13 @@ jobs:
             CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
                   
             if [[ "$CACHED_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-              # Validate each octet is 0-255
               IFS='.' read -ra OCTETS <<< "$CACHED_IP"
               VALID=true
               for octet in "${OCTETS[@]}"; do
                 if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
                   VALID=false
                   break
-                fi # *** FIX #1: 'end' was changed to 'fi' ***
+                fi
               done
                     
               if [ "$VALID" = true ]; then
@@ -240,7 +238,6 @@ jobs:
             exit 1
           fi
       
-          # Validate octets are within range
           IFS='.' read -ra FINAL_OCTETS <<< "$BEST_IP"
           for octet in "${FINAL_OCTETS[@]}"; do
             if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
@@ -281,27 +278,17 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
       
-      # =================================================================
-      #
-      #   *** FIX APPLIED HERE: Added 'command: whoami' ***
-      #   (This was kept as requested)
-      #
-      # =================================================================
-
+      # This step only installs Wrangler and authenticates
       - name: Setup Wrangler CLI (Official Action)
         uses: cloudflare/wrangler-action@v3
         with:
-          # This uses the secret to authenticate
           apiToken: ${{ secrets.CF_API_TOKEN }}
-          # This sets the default account ID for subsequent commands
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # *** FIX ***: Prevents deployment error, only installs Wrangler
-          command: whoami 
+          command: whoami # Prevents deployment, just installs and auths
 
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
-          # Wrangler is now installed and authenticated from the previous step
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
@@ -317,7 +304,6 @@ jobs:
           echo "   • KV Key: ${CF_VAR_KEY}"
           echo "   • Best IP: ${BESTIP}"
           
-          # Validate all required environment variables
           for required_var in CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
               echo "❌ ERROR: ${required_var} is not set"
@@ -326,12 +312,11 @@ jobs:
           done
           
           echo "=> All required environment variables validated"
-          
           echo "🚀 Attempting to update KV value..."
           
           set +e
-          # Command now works because 'wrangler' is correctly installed in the PATH
-          wrangler kv:key put \
+          # *** FIX APPLIED HERE: Use 'npx wrangler' instead of just 'wrangler' ***
+          npx wrangler kv:key put \
             --namespace-id "${CF_KV_NAMESPACE_ID}" \
             "${CF_VAR_KEY}" \
             "${BESTIP}"
@@ -349,7 +334,7 @@ jobs:
           
           echo "✅ KV successfully updated with IP: ${BESTIP}"
           
-          # --- Health Check (No changes needed) ---
+          # --- Health Check ---
           if [ -n "${CF_WORKER_NAME}" ]; then
             echo ""
             echo "=> Performing Worker health check..."
@@ -398,7 +383,7 @@ jobs:
             fi
           else
             echo "=> Skipping health check (CF_WORKER_NAME not configured)"
-          fi # *** FIX #2: 'end' was changed to 'fi' ***
+          fi
           # --- End Health Check ---
                   
           echo ""
