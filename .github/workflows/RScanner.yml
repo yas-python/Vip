@@ -22,7 +22,7 @@ env:
   SCAN_LOG: scan.log
   MAX_CF_RETRIES: "5"
   CF_RETRY_BASE_SLEEP: "2"
-  SCANNER_TIMEOUT: "600"
+  SCANNER_TIMEOUT: "1"
 
 jobs:
   update-proxy-variable:
@@ -147,7 +147,7 @@ jobs:
           # Extract IP addresses and latencies - looking for patterns like:
           # "PROXY LIVE ✅: 20.63.17.53 (1615ms)" or similar formats
           grep -iE "(PROXY[[:space:]]+LIVE|selected.*IP|best.*IP)" "$LOG" | \
-            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
+            grep -oE '([0-9]{1,3}\.){3}[0-9]{1_3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
             sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
             awk '{
               # Validate IP format (each octet must be 0-255)
@@ -279,61 +279,47 @@ jobs:
           path: candidates.txt
           retention-days: 7
           if-no-files-found: ignore
+      
+      # =================================================================
+      #
+      #   *** FIX APPLIED HERE ***
+      #   Replaced the broken 'curl | bash' script with the official,
+      #   robust, and maintained Cloudflare Wrangler Action.
+      #   This action installs Wrangler and handles authentication.
+      #
+      # =================================================================
 
-      - name: Install Wrangler CLI (official Cloudflare tool)
-        run: |
-          set -euo pipefail
-          echo "=> Installing Wrangler v3..."
-          
-          #
-          # *** FIX APPLIED HERE ***
-          # Bypassing the failing 'get.wrangler.dev' DNS by using the direct script URL.
-          #
-          curl -sSL --retry 3 --retry-delay 5 "https://raw.githubusercontent.com/cloudflare/wrangler-action/v3.0.0/scripts/install-wrangler.sh" | bash
-          
-          # Add wrangler to the GITHUB_PATH for subsequent steps
-          echo "$HOME/.wrangler/bin" >> $GITHUB_PATH
-          echo "✅ Wrangler installed: $(wrangler --version)"
-
-      - name: Configure Wrangler authentication
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CF_API_TOKEN}" ]; then
-            echo "❌ FATAL: CF_API_TOKEN secret is not set."
-            exit 1
-          fi
-          echo "=> Configuring Wrangler authentication..."
-          # Configure wrangler to use the API token for non-interactive auth
-          export CLOUDFLARE_API_TOKEN="${CF_API_TOKEN}"
-          # Run a simple command to verify auth and cache credentials
-          wrangler whoami
-          echo "✅ Wrangler authentication configured"
+      - name: Setup Wrangler CLI (Official Action)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          # This uses the secret to authenticate
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          # This sets the default account ID for subsequent commands
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
 
       - name: Update Cloudflare KV using Wrangler
         id: update-kv
         env:
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }} # Used by wrangler
+          # Auth secrets (CF_API_TOKEN, CF_ACCOUNT_ID) are no longer needed here.
+          # The 'cloudflare/wrangler-action' step above already configured them.
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
           BESTIP: ${{ steps.scan.outputs.bestip }}
         run: |
           set -euo pipefail
-          export CLOUDFLARE_API_TOKEN="${CF_API_TOKEN}"
-
+          # No 'export CLOUDFLARE_API_TOKEN' needed.
+          
           echo "=== Cloudflare KV update (Wrangler) started ==="
           echo "=> Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=> Configuration:"
-          echo "   • Account ID: ***_ID"
+          echo "   • Account ID: ***_ID (Set by Wrangler Action)"
           echo "   • KV Namespace ID: ${CF_KV_NAMESPACE_ID}"
           echo "   • KV Key: ${CF_VAR_KEY}"
           echo "   • Best IP: ${BESTIP}"
           
           # Validate all required environment variables
-          for required_var in CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
+          for required_var in CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
               echo "❌ ERROR: ${required_var} is not set"
               exit 1
@@ -345,11 +331,10 @@ jobs:
           echo "🚀 Attempting to update KV value..."
           
           set +e
-          # Use Wrangler to put the key.
-          # This method avoids the 405 (Method Not Allowed) error.
+          # The command is now simpler: --account-id is not needed
+          # because the Wrangler Action already set it as default.
           wrangler kv:key put \
             --namespace-id "${CF_KV_NAMESPACE_ID}" \
-            --account-id "${CF_ACCOUNT_ID}" \
             "${CF_VAR_KEY}" \
             "${BESTIP}"
           
@@ -360,14 +345,13 @@ jobs:
             echo "❌ FATAL: Wrangler command failed with exit code $WRANGLER_EXIT_CODE"
             echo "=> Please check your secrets and permissions:"
             echo "   1. Verify CF_API_TOKEN is valid and has 'Workers KV Storage:Edit' permission."
-            echo "   2. Verify CF_ACCOUNT_ID is correct."
-            echo "   3. Verify CF_KV_NAMESPACE_ID is correct."
+            echo "   2. Verify CF_KV_NAMESPACE_ID is correct."
             exit 1
           fi
           
           echo "✅ KV successfully updated with IP: ${BESTIP}"
           
-          # --- Health Check (Copied from original script) ---
+          # --- Health Check (No changes needed) ---
           if [ -n "${CF_WORKER_NAME}" ]; then
             echo ""
             echo "=> Performing Worker health check..."
@@ -481,3 +465,4 @@ jobs:
           echo "=> Execution completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=> Status: Complete"
           echo "=> All steps executed successfully"
+
