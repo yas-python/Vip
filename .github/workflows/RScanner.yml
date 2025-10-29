@@ -245,26 +245,11 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20' # Use a current LTS version
-
-      - name: Install Wrangler CLI
-        run: |
-          set -euo pipefail
-          echo "=> Installing Wrangler CLI using npm..."
-          npm install -g wrangler
-          echo "=> Wrangler version check:"
-          wrangler --version
-
-      - name: Update Cloudflare KV using Wrangler
+      - name: Update Cloudflare KV using cURL (API)
         id: update-kv
         env:
-          # Use new env var names for Wrangler, mapped from your old secrets
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }} 
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          # Keep other variables as they are
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
@@ -272,9 +257,9 @@ jobs:
         run: |
           set -euo pipefail
           
-          echo "=== Cloudflare KV update (Wrangler) started ==="
+          echo "=== Cloudflare KV update (cURL API) started ==="
           
-          # Check for the new variable names
+          # Check for required variables
           for required_var in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
             if [ -z "${!required_var}" ]; then
               echo "❌ ERROR: ${required_var} is not set"
@@ -282,24 +267,43 @@ jobs:
             fi
           done
           
-          echo "🚀 Attempting to update KV value: ${BESTIP}"
+          echo "🚀 Attempting to update KV value: ${BESTIP} for key: ${CF_VAR_KEY}"
+          
+          # URL-encode the key name
+          ENCODED_KEY=$(echo -n "${CF_VAR_KEY}" | jq -sRr @uri)
+          
+          API_URL="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}/values/${ENCODED_KEY}"
+          
+          echo "=> Calling API: ${API_URL}"
           
           set +e
-          
-          # *** THIS IS THE FIX: Use "kv key put" (space) not "kv:key put" (colon) ***
-          wrangler kv key put \
-            "${CF_VAR_KEY}" \
-            "${BESTIP}" \
-            --namespace-id "${CF_KV_NAMESPACE_ID}"
-          
-          WRANGLER_EXIT_CODE=$?
+          # Make the API call and capture body and status code
+          http_response=$(curl -s -X PUT "${API_URL}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: text/plain" \
+            --data "${BESTIP}" \
+            -w "\n%{http_code}")
           set -e
           
-          if [ $WRANGLER_EXIT_CODE -ne 0 ]; then
-            echo "❌ FATAL: Wrangler command failed with exit code $WRANGLER_EXIT_CODE"
-            # Dump wrangler log for debugging
-            echo "=> Dumping wrangler log:"
-            cat /home/runner/.config/wrangler/logs/wrangler-*.log 2>/dev/null || echo "No log file found."
+          # Separate body and status code
+          http_body=$(echo -n "$http_response" | head -n -1)
+          http_status=$(echo -n "$http_response" | tail -n 1)
+          
+          echo "=> API Response Status: $http_status"
+          echo "=> API Response Body: $http_body"
+          
+          # Check for success (HTTP 200)
+          if [ "$http_status" -ne 200 ]; then
+            echo "❌ FATAL: Cloudflare API request failed with status code $http_status"
+            exit 1
+          fi
+          
+          # Parse JSON response to be sure
+          success_json=$(echo -n "$http_body" | jq -r '.success')
+          
+          if [ "$success_json" != "true" ]; then
+            echo "❌ FATAL: API reported success=false"
+            echo "Errors: $(echo -n "$http_body" | jq -r '.errors')"
             exit 1
           fi
           
@@ -314,12 +318,12 @@ jobs:
             max_health_checks=3
                   
             for health_attempt in $(seq 1 $max_health_checks); do
-              http_status=$(curl -s -o /dev/null -w "%{http_code}" \
+              http_status_health=$(curl -s -o /dev/null -w "%{http_code}" \
                 --max-time 10 \
                 --connect-timeout 5 \
                 "${HEALTH_URL}" 2>/dev/null || echo "000")
                     
-              if [ "$http_status" = "200" ]; then
+              if [ "$http_status_health" = "200" ]; then
                 health_check_passed=true
                 break
               fi
@@ -337,7 +341,7 @@ jobs:
           
           echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
           echo "✅ Cloudflare KV update completed successfully"
-          echo "=== Cloudflare KV update (Wrangler) ended ==="
+          echo "=== Cloudflare KV update (cURL API) ended ==="
 
   post-cache-artifacts:
     name: Post Cache Rust artifacts & registry
