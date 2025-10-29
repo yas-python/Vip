@@ -285,11 +285,13 @@ jobs:
           echo "🚀 Attempting to update KV value: ${BESTIP}"
           
           set +e
-          # Using the globally installed wrangler (not npx)
+          
+          # *** FIX: Correct argument order for Wrangler v4+ ***
+          # Positional arguments (KEY and VALUE) must come BEFORE options (--namespace-id)
           wrangler kv:key put \
-            --namespace-id "${CF_KV_NAMESPACE_ID}" \
             "${CF_VAR_KEY}" \
-            "${BESTIP}"
+            "${BESTIP}" \
+            --namespace-id "${CF_KV_NAMESPACE_ID}"
           
           WRANGLER_EXIT_CODE=$?
           set -e
