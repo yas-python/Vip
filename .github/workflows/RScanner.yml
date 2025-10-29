@@ -22,7 +22,7 @@ env:
   SCAN_LOG: scan.log
   MAX_CF_RETRIES: "5"
   CF_RETRY_BASE_SLEEP: "2"
-  SCANNER_TIMEOUT: "1"
+  SCANNER_TIMEOUT: "600"
 
 jobs:
   update-proxy-variable:
@@ -465,4 +465,3 @@ jobs:
           echo "=> Execution completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "=> Status: Complete"
           echo "=> All steps executed successfully"
-
