@@ -1,3 +1,4 @@
+# Rust Proxy Scanner (Ultimate) - KV Update (final, robust)
 name: Rust Proxy Scanner (Ultimate) - KV Update
 
 on:
@@ -26,7 +27,7 @@ env:
 
 jobs:
   update-proxy-variable:
-    name: Build → Scan → Update Cloudflare KV (RScanner)
+    name: Build → Scan → Update Cloudflare KV (RScanner → CF REST API)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -76,20 +77,15 @@ jobs:
         run: |
           set -euo pipefail
           echo "=> Starting cargo build --release"
-          echo "=> Build timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-                
           if ! cargo build --release 2>&1 | tee build-output.log; then
             echo "❌ Cargo build failed. Showing last 200 lines:"
             tail -n 200 build-output.log || true
             exit 1
           fi
-                
           echo "✅ Cargo build completed successfully"
           ls -lah target/release/ || true
-                
           if [ -f "${{ env.SCAN_BINARY }}" ]; then
-            file "${{ env.SCAN_BINARY }}" || true
-            echo "✅ Scanner binary verified"
+            echo "✅ Scanner binary exists: ${{ env.SCAN_BINARY }}"
           else
             echo "❌ ERROR: Scanner binary not found at ${{ env.SCAN_BINARY }}"
             exit 1
@@ -101,46 +97,33 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Scanner execution started ==="
-          echo "=> Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-                
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
           CACHE_FILE="${{ env.CACHE_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
-                
+
           : > "$LOG"
-      
+
           if [ ! -f "$BIN" ]; then
             echo "❌ FATAL: Scanner binary not found at $BIN"
             ls -la target/release/ || true
             exit 1
           fi
-      
           chmod +x "$BIN"
-                
-          echo "🚀 Executing scanner (timeout: ${TIMEOUT}s)"
-                
+
           set +e
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1
           SCANNER_EXIT_CODE=$?
           set -e
-                
+
           if [ $SCANNER_EXIT_CODE -eq 0 ]; then
             echo "✅ Scanner completed successfully"
           elif [ $SCANNER_EXIT_CODE -eq 124 ]; then
             echo "⚠️ Scanner timed out after ${TIMEOUT}s"
-            echo "=> Attempting to parse available results..."
           else
             echo "⚠️ Scanner exited with code $SCANNER_EXIT_CODE"
-            echo "=> Attempting to parse available results..."
           fi
-      
-          echo "=> Scanner finished at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          LOG_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-          echo "=> Log contains ${LOG_LINES} lines"
-      
-          echo "🔍 Parsing results for live proxies..."
-                
+
           grep -iE "(PROXY[[:space:]]+LIVE)" "$LOG" | \
             grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
             sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
@@ -150,41 +133,30 @@ jobs:
                 print $1, $2
               }
             }' > unsorted_candidates.txt || touch unsorted_candidates.txt
-                
+
           if [ -s unsorted_candidates.txt ]; then
-            sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || {
-              echo "⚠️ Sort command failed, using unsorted data"
-              head -n 20 unsorted_candidates.txt > candidates.txt
-            }
+            sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || head -n 20 unsorted_candidates.txt > candidates.txt
           else
             touch candidates.txt
           fi
-      
+
           CANDIDATES_COUNT=$(wc -l < candidates.txt 2>/dev/null || echo 0)
           echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
-                
-          if [ "$CANDIDATES_COUNT" -gt 0 ]; then
-            echo "=> Top 5 candidates (sorted by lowest latency):"
-            head -n 5 candidates.txt | while read -r latency ip; do
-              echo "   • $ip → ${latency}ms latency"
-            done
-          fi
-      
+
           BEST_IP=""
           BEST_LATENCY=""
-      
+
           if [ -s candidates.txt ]; then
-            read -r BEST_LATENCY BEST_IP < candidates.txt
-            echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms latency"
+            read -r BEST_LATENCY BEST_IP < candidates.txt || true
+            echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms"
           else
             echo "🟡 No live proxies found in current scan results"
           fi
-      
+
           if [ -z "${BEST_IP}" ] && [ -f "${CACHE_FILE}" ]; then
             echo "🔁 Attempting to use cached IP as fallback..."
             CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
-                  
-            if [[ "$CACHED_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            if [[ "$CACHED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
               IFS='.' read -ra OCTETS <<< "$CACHED_IP"
               VALID=true
               for octet in "${OCTETS[@]}"; do
@@ -193,27 +165,24 @@ jobs:
                   break
                 fi
               done
-              
               if [ "$VALID" = true ]; then
                 BEST_IP="$CACHED_IP"
                 echo "✅ Using cached IP: $BEST_IP"
               else
-                echo "⚠️ Cached IP has invalid octets: ${CACHED_IP}"
+                echo "⚠️ Cached IP invalid: ${CACHED_IP}"
               fi
             else
               echo "⚠️ Cache contains invalid IP format: ${CACHED_IP}"
             fi
           fi
-      
+
           if [ -z "${BEST_IP}" ]; then
             echo "❌ FATAL: No valid IP available from scan or cache"
             tail -n 150 "$LOG" || true
             exit 1
           fi
-      
-          echo "💾 Saving best IP to cache"
+
           echo -n "$BEST_IP" > "${CACHE_FILE}"
-      
           echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
           echo "✅ Scanner step completed successfully"
 
@@ -234,153 +203,125 @@ jobs:
           path: candidates.txt
           retention-days: 7
           if-no-files-found: ignore
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
 
-      - name: Install Wrangler CLI
+      - name: Install Wrangler CLI (kept for compatibility; not required for KV write)
         run: |
           set -euo pipefail
           echo "=> Installing Wrangler CLI using npm..."
-          npm install -g wrangler@latest
-          echo "=> Wrangler version check:"
-          wrangler --version
+          npm install -g wrangler@latest || true
+          wrangler --version || true
 
-      - name: Update Cloudflare KV using Wrangler
+      - name: Update Cloudflare KV via Cloudflare REST API (curl) with verification & retries
         id: update-kv
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
-          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
           BESTIP: ${{ steps.scan.outputs.bestip }}
         run: |
           set -euo pipefail
-          
-          echo "=== Cloudflare KV update (Wrangler) started ==="
-          
-          # Verify all required environment variables
-          for required_var in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
-            if [ -z "${!required_var}" ]; then
-              echo "❌ ERROR: ${required_var} is not set"
+          echo "=== Cloudflare KV update (REST API) started ==="
+          # Required env check
+          for var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
+            if [ -z "${!var}" ]; then
+              echo "❌ ERROR: $var is not set"
               exit 1
             fi
           done
-          
-          echo "✅ All required environment variables are set"
-          echo "🚀 Attempting to update KV value: ${BESTIP}"
-          echo "=> Namespace ID: ${CF_KV_NAMESPACE_ID}"
-          echo "=> Key: ${CF_VAR_KEY}"
-          
-          # Create a temporary file with the IP value
-          echo -n "${BESTIP}" > /tmp/kv_value.txt
-          
-          # Test Wrangler authentication first
-          echo "=> Testing Wrangler authentication..."
-          if ! wrangler whoami 2>&1 | tee /tmp/whoami.log; then
-            echo "❌ Wrangler authentication failed"
-            cat /tmp/whoami.log
-            exit 1
-          fi
-          echo "✅ Wrangler authentication successful"
-          
-          # Update KV with detailed error handling
-          echo "=> Executing KV update command..."
-          
-          if wrangler kv key put "${CF_VAR_KEY}" "${BESTIP}" \
-            --namespace-id "${CF_KV_NAMESPACE_ID}" \
-            --preview false 2>&1 | tee /tmp/kv_update.log; then
-            
-            echo "✅ KV update command executed successfully"
-            
-            # Verify the update by reading back the value
-            echo "=> Verifying KV update..."
-            sleep 2  # Give KV a moment to propagate
-            
-            if wrangler kv key get "${CF_VAR_KEY}" \
-              --namespace-id "${CF_KV_NAMESPACE_ID}" \
-              --preview false > /tmp/kv_verify.txt 2>&1; then
-              
-              STORED_VALUE=$(cat /tmp/kv_verify.txt | tr -d '\n\r\t ')
-              
-              if [ "${STORED_VALUE}" = "${BESTIP}" ]; then
-                echo "✅ KV verification successful - Value matches: ${STORED_VALUE}"
-              else
-                echo "⚠️ WARNING: Stored value (${STORED_VALUE}) doesn't match expected (${BESTIP})"
-              fi
-            else
-              echo "⚠️ Could not verify KV value, but update command succeeded"
-              cat /tmp/kv_verify.txt
-            fi
-            
-          else
-            echo "❌ FATAL: Wrangler KV update failed"
-            echo "=> Command output:"
-            cat /tmp/kv_update.log
-            
-            # Additional debugging information
-            echo "=> Checking namespace access..."
-            wrangler kv namespace list 2>&1 || echo "Could not list namespaces"
-            
-            exit 1
-          fi
-          
-          # Perform Worker health check if configured
-          if [ -n "${CF_WORKER_NAME}" ]; then
-            echo "=> Performing Worker health check..."
-            HEALTH_URL="https://${CF_WORKER_NAME}.workers.dev/health"
-            
-            health_check_passed=false
-            max_health_checks=3
-                  
-            for health_attempt in $(seq 1 $max_health_checks); do
-              echo "=> Health check attempt ${health_attempt}/${max_health_checks}"
-              
-              http_status=$(curl -s -o /tmp/health_response.txt -w "%{http_code}" \
-                --max-time 10 \
-                --connect-timeout 5 \
-                "${HEALTH_URL}" 2>/dev/null || echo "000")
-                    
-              if [ "$http_status" = "200" ]; then
-                echo "✅ Health check passed (HTTP ${http_status})"
-                health_check_passed=true
-                break
-              else
-                echo "⚠️ Health check returned HTTP ${http_status}"
-                if [ -f /tmp/health_response.txt ]; then
-                  echo "=> Response:"
-                  head -n 20 /tmp/health_response.txt
-                fi
-              fi
-              
-              if [ "$health_attempt" -lt "$max_health_checks" ]; then
-                sleep 3
-              fi
-            done
-      
-            if [ "$health_check_passed" = "false" ]; then
-              echo "⚠️ WARNING: Health check failed, but KV was updated to: ${BESTIP}"
-              echo "=> This may indicate a Worker configuration issue, not a KV issue"
-            fi
-          else
-            echo "=> Skipping health check (CF_WORKER_NAME not configured)"
-          fi
-          
-          # Set output for subsequent jobs
-          echo "bestip=${BESTIP}" >> "$GITHUB_OUTPUT"
-          echo "✅ Cloudflare KV update completed successfully"
-          echo "=== Final IP in KV: ${BESTIP} ==="
-          echo "=== Cloudflare KV update (Wrangler) ended ==="
+          echo "✅ Required env vars present"
 
-      - name: Upload Wrangler logs for debugging
+          API_BASE="https://api.cloudflare.com/client/v4"
+          NAMESPACE_ID="${CF_KV_NAMESPACE_ID}"
+          ACCOUNT_ID="${CF_ACCOUNT_ID}"
+          KEY="${CF_VAR_KEY}"
+          VALUE="${BESTIP}"
+          AUTH_HEADER="Authorization: Bearer ${CF_API_TOKEN}"
+
+          # 1) Verify namespace exists (list namespaces and check)
+          echo "=> Verifying KV namespace exists under account ${ACCOUNT_ID}..."
+          ns_list=$(curl -sSf -H "${AUTH_HEADER}" "${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces" ) || {
+            echo "❌ Failed to list KV namespaces. Response:"
+            curl -s -D - -H "${AUTH_HEADER}" "${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces" || true
+            exit 1
+          }
+          if ! echo "$ns_list" | jq -e --arg nsid "$NAMESPACE_ID" '.result[] | select(.id==$nsid)' >/dev/null 2>&1; then
+            echo "❌ ERROR: Namespace ID ${NAMESPACE_ID} not found in account ${ACCOUNT_ID}"
+            echo "=> Available namespaces (first 20):"
+            echo "$ns_list" | jq -r '.result[] | "\(.id)\t\(.title)"' | head -n 20 || true
+            exit 1
+          fi
+          echo "✅ Namespace ${NAMESPACE_ID} verified."
+
+          # 2) Put key (use retries)
+          put_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KEY}"
+          attempt=0
+          max_attempts=5
+          sleep_base=2
+
+          echo "=> Attempting to PUT key '${KEY}' => '${VALUE}' into namespace ${NAMESPACE_ID}"
+
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt+1))
+            echo "=> PUT attempt $attempt/$max_attempts..."
+            # Use curl to PUT raw body
+            http_status=$(curl -s -o /tmp/cf_put_resp -w "%{http_code}" -X PUT \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: text/plain" \
+              --data-binary "${VALUE}" \
+              "${put_url}" || echo "000")
+
+            if [ "$http_status" = "200" ] || [ "$http_status" = "201" ] || [ "$http_status" = "204" ]; then
+              echo "✅ PUT successful (HTTP ${http_status})"
+              break
+            else
+              echo "⚠️ PUT returned HTTP ${http_status}"
+              if [ -s /tmp/cf_put_resp ]; then
+                echo "=> Response body:"
+                head -n 200 /tmp/cf_put_resp || true
+              fi
+              if [ $attempt -lt $max_attempts ]; then
+                sleep_seconds=$(( sleep_base * attempt ))
+                echo "=> Retrying in ${sleep_seconds}s..."
+                sleep $sleep_seconds
+              else
+                echo "❌ All PUT attempts failed. Exiting."
+                exit 1
+              fi
+            fi
+          done
+
+          # 3) Verify by GET
+          echo "=> Verifying stored value with GET..."
+          get_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KEY}"
+          http_status=$(curl -s -o /tmp/cf_get_resp -w "%{http_code}" -H "Authorization: Bearer ${CF_API_TOKEN}" "${get_url}" || echo "000")
+          if [ "$http_status" = "200" ]; then
+            stored_value=$(cat /tmp/cf_get_resp | tr -d '\r\n\t ')
+            if [ "$stored_value" = "$VALUE" ]; then
+              echo "✅ KV verification passed. Value matches: ${stored_value}"
+            else
+              echo "⚠️ KV verification mismatch. Stored:'${stored_value}' Expected:'${VALUE}'"
+              echo "=> Forcing success exit but please inspect logs. (You can change this to exit 1 if strict)"
+              # If you want to fail the workflow on mismatch, uncomment next line:
+              # exit 1
+            fi
+          else
+            echo "⚠️ GET returned HTTP ${http_status} — could not verify value."
+            if [ -s /tmp/cf_get_resp ]; then head -n 200 /tmp/cf_get_resp; fi
+            # optionally fail:
+            # exit 1
+          fi
+
+          echo "bestip=${VALUE}" >> "$GITHUB_OUTPUT"
+          echo "✅ Cloudflare KV REST API update completed."
+          echo "=== Final IP in KV: ${VALUE} ==="
+
+      - name: Upload Cloudflare REST API logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wrangler-logs-${{ github.run_id }}
-          path: /tmp/*.log
+          name: cf-rest-logs-${{ github.run_id }}
+          path: /tmp/cf_*.log,/tmp/cf_put_resp,/tmp/cf_get_resp
           retention-days: 7
           if-no-files-found: ignore
 
@@ -413,7 +354,7 @@ jobs:
     steps:
       - name: Checkout for cleanup
         uses: actions/checkout@v4
-              
+
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
