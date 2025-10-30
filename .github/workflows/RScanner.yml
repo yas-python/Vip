@@ -1,4 +1,4 @@
-# Rust Proxy Scanner (Ultimate) - KV Update (final, robust)
+# Rust Proxy Scanner (Ultimate) - KV Update (final, no-IP-cache, robust)
 name: Rust Proxy Scanner (Ultimate) - KV Update
 
 on:
@@ -16,7 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CACHE_FILE: .cachelastbestip.txt
+  # Note: We intentionally DO NOT use a cache file for IP (per your request).
   RUST_CACHE_KEY: v4
   CF_ENVIRONMENT: production
   SCAN_BINARY: ./target/release/RScanner
@@ -24,6 +24,8 @@ env:
   MAX_CF_RETRIES: "5"
   CF_RETRY_BASE_SLEEP: "2"
   SCANNER_TIMEOUT: "600"
+  # TOP_N only relevant if you later want to sample among top N; default 1 -> absolute lowest
+  TOP_N: "1"
 
 jobs:
   update-proxy-variable:
@@ -46,16 +48,6 @@ jobs:
           sudo apt-get update -y
           echo "=> Installing required packages..."
           sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
-
-      - name: Restore Best IP Cache
-        uses: actions/cache@v4
-        id: ip-cache
-        with:
-          path: ${{ env.CACHE_FILE }}
-          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
-          restore-keys: |
-            rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-
-            rust-proxy-scanner-best-ip-cache-
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -91,16 +83,16 @@ jobs:
             exit 1
           fi
 
-      - name: Run scanner and select best IP (Lowest Ping)
+      - name: Run scanner and select best IP (absolute lowest latency, no IP cache)
         id: scan
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          echo "=== Scanner execution started ==="
+          echo "=== Scanner execution started (choose absolute lowest latency) ==="
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
-          CACHE_FILE="${{ env.CACHE_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
+          TOP_N=${TOP_N:-1}
 
           : > "$LOG"
           rm -f unsorted_candidates.txt candidates.txt || true
@@ -127,21 +119,15 @@ jobs:
             echo "⚠️ Scanner exited with code $SCANNER_EXIT_CODE (partial results may exist)"
           fi
 
-          # Robust extraction: support formats such as:
-          # "PROXY LIVE 1.2.3.4 (123 ms)"  or "... (123ms)" or "... (1 s)" etc.
-          # Use awk to parse lines and print: latency_ms ip
+          # Parse candidate lines into "latency ip" format (latency in ms)
           awk '
             BEGIN { IGNORECASE=1 }
             /PROXY[[:space:]]+LIVE/ {
-              # try to capture ms inside parentheses
               if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*ms\)/, m)) {
                 latency = m[1] + 0
               } else if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*s\)/, s)) {
-                # convert seconds to ms
                 latency = (s[1] + 0) * 1000
-              } else {
-                next
-              }
+              } else { next }
               if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ipm)) {
                 ip = ipm[1]
                 print latency, ip
@@ -149,77 +135,44 @@ jobs:
             }
           ' "$LOG" > unsorted_candidates.txt || true
 
-          # If awk produced nothing, try a fallback grep+sed pipeline (lenient)
+          # fallback lenient parse if necessary
           if [ ! -s unsorted_candidates.txt ]; then
             grep -iE "PROXY[[:space:]]+LIVE" "$LOG" | \
               grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}.*\([0-9]+.*\)' | \
               sed -E 's/.*(([0-9]{1,3}\.){3}[0-9]{1,3}).*\(([[:space:]]*[0-9]+)[[:space:]]*ms\).*/\3 \1/' >> unsorted_candidates.txt || true
           fi
 
-          # sanitize lines and keep only valid IPv4 + numeric latency
+          # sanitize: valid numeric latency and IPv4 format
           awk '{ if ($1+0 > 0 && match($2, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) print $1, $2 }' unsorted_candidates.txt > unsorted_candidates.filtered.txt || true
           mv unsorted_candidates.filtered.txt unsorted_candidates.txt || true
 
-          # Now sort numerically by latency and keep top 20
+          # Now sort numeric by latency asc and keep top TOP_N (TOP_N=1 -> absolute lowest)
           if [ -s unsorted_candidates.txt ]; then
-            sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt || cp unsorted_candidates.txt candidates.txt
+            sort -n -k1,1 unsorted_candidates.txt | head -n "${TOP_N}" > candidates.txt || cp unsorted_candidates.txt candidates.txt
           else
             touch candidates.txt
           fi
 
           CANDIDATES_COUNT=$(wc -l < candidates.txt 2>/dev/null || echo 0)
-          echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
-
-          BEST_IP=""
-          BEST_LATENCY=""
+          echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs (kept top ${TOP_N})"
+          echo "=> candidates.txt content:"
+          cat candidates.txt || true
 
           if [ -s candidates.txt ]; then
-            # read safest way
+            # If TOP_N>1, we still select the absolute lowest (first line), since requirement is کمتر پینگ
             read -r BEST_LATENCY BEST_IP < <(head -n1 candidates.txt) || true
-            echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms"
+            echo "🎯 Best IP selected (lowest ping): ${BEST_IP} with ${BEST_LATENCY}ms"
           else
-            echo "🟡 No live proxies found in current scan results"
-          fi
-
-          # Fallback to cached IP if nothing found
-          if [ -z "${BEST_IP:-}" ] && [ -f "${CACHE_FILE}" ]; then
-            echo "🔁 Attempting to use cached IP as fallback..."
-            CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
-            if [[ "$CACHED_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-              IFS='.' read -ra OCTETS <<< "$CACHED_IP"
-              VALID=true
-              for octet in "${OCTETS[@]}"; do
-                if [ -z "$octet" ] || [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
-                  VALID=false
-                  break
-                fi
-              done
-              if [ "$VALID" = true ]; then
-                BEST_IP="$CACHED_IP"
-                BEST_LATENCY="(cached)"
-                echo "✅ Using cached IP: $BEST_IP"
-              else
-                echo "⚠️ Cached IP invalid: ${CACHED_IP}"
-              fi
-            else
-              echo "⚠️ Cache contains invalid IP format: ${CACHED_IP}"
-            fi
-          fi
-
-          if [ -z "${BEST_IP:-}" ]; then
-            echo "❌ FATAL: No valid IP available from scan or cache"
+            echo "❌ FATAL: No live proxies found in current scan results (no caching allowed per config)"
             echo "=== Last 200 lines of scanner log for debugging ==="
             tail -n 200 "$LOG" || true
             exit 1
           fi
 
-          # Persist and set outputs
-          echo -n "$BEST_IP" > "${CACHE_FILE}"
-          # export to GITHUB_OUTPUT properly (supports multiline safe)
+          # Export result to GitHub Actions outputs
           echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
-          # Also save candidate list for debugging artifact
-          echo "=> Final chosen IP: ${BEST_IP} (latency: ${BEST_LATENCY})"
-          echo "✅ Scanner step completed successfully"
+          echo "=> Final chosen IP: ${BEST_IP} (latency: ${BEST_LATENCY}ms)"
+          echo "✅ Scanner selection step completed successfully"
 
       - name: Upload scan.log for debugging (always)
         if: always()
@@ -360,26 +313,8 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  post-cache-artifacts:
-    name: Post Cache Rust artifacts & registry
-    runs-on: ubuntu-latest
-    needs: update-proxy-variable
-    if: always()
-    steps:
-      - name: Cache maintenance completed
-        run: echo "Cache maintenance completed."
-
-  post-restore-ip-cache:
-    name: Post Restore Best IP Cache
-    runs-on: ubuntu-latest
-    needs: update-proxy-variable
-    if: always()
-    steps:
-      - name: IP cache status
-        run: echo "Best IP cache has been updated for subsequent workflow runs"
-
   cleanup-runs:
-    name: Post Checkout repository (full)
+    name: Cleanup old workflow runs (optional)
     runs-on: ubuntu-latest
     needs: update-proxy-variable
     if: always()
