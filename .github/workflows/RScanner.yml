@@ -4,7 +4,7 @@ name: Rust Proxy Scanner (Ultimate) - KV Update
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 * * * *' # every hour
 
 concurrency:
   group: rust-proxy-scan-final-plaintext
@@ -103,6 +103,8 @@ jobs:
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
 
           : > "$LOG"
+          rm -f unsorted_candidates.txt candidates.txt || true
+          touch unsorted_candidates.txt candidates.txt
 
           if [ ! -f "$BIN" ]; then
             echo "❌ FATAL: Scanner binary not found at $BIN"
@@ -111,6 +113,7 @@ jobs:
           fi
           chmod +x "$BIN"
 
+          # Run scanner safely and capture exit code; always save output to $LOG
           set +e
           timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1
           SCANNER_EXIT_CODE=$?
@@ -121,21 +124,45 @@ jobs:
           elif [ $SCANNER_EXIT_CODE -eq 124 ]; then
             echo "⚠️ Scanner timed out after ${TIMEOUT}s"
           else
-            echo "⚠️ Scanner exited with code $SCANNER_EXIT_CODE"
+            echo "⚠️ Scanner exited with code $SCANNER_EXIT_CODE (partial results may exist)"
           fi
 
-          grep -iE "(PROXY[[:space:]]+LIVE)" "$LOG" | \
-            grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]*\([0-9]+[[:space:]]*m?s\)' | \
-            sed -E 's/^[[:space:]]*([0-9.]+)[[:space:]]*\(([0-9]+)[[:space:]]*m?s\)/\2 \1/' | \
-            awk '{
-              split($2, octets, ".")
-              if (length(octets) == 4 && $1 ~ /^[0-9]+$/ && $1 > 0) {
-                print $1, $2
+          # Robust extraction: support formats such as:
+          # "PROXY LIVE 1.2.3.4 (123 ms)"  or "... (123ms)" or "... (1 s)" etc.
+          # Use awk to parse lines and print: latency_ms ip
+          awk '
+            BEGIN { IGNORECASE=1 }
+            /PROXY[[:space:]]+LIVE/ {
+              # try to capture ms inside parentheses
+              if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*ms\)/, m)) {
+                latency = m[1] + 0
+              } else if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*s\)/, s)) {
+                # convert seconds to ms
+                latency = (s[1] + 0) * 1000
+              } else {
+                next
               }
-            }' > unsorted_candidates.txt || touch unsorted_candidates.txt
+              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ipm)) {
+                ip = ipm[1]
+                print latency, ip
+              }
+            }
+          ' "$LOG" > unsorted_candidates.txt || true
 
+          # If awk produced nothing, try a fallback grep+sed pipeline (lenient)
+          if [ ! -s unsorted_candidates.txt ]; then
+            grep -iE "PROXY[[:space:]]+LIVE" "$LOG" | \
+              grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}.*\([0-9]+.*\)' | \
+              sed -E 's/.*(([0-9]{1,3}\.){3}[0-9]{1,3}).*\(([[:space:]]*[0-9]+)[[:space:]]*ms\).*/\3 \1/' >> unsorted_candidates.txt || true
+          fi
+
+          # sanitize lines and keep only valid IPv4 + numeric latency
+          awk '{ if ($1+0 > 0 && match($2, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) print $1, $2 }' unsorted_candidates.txt > unsorted_candidates.filtered.txt || true
+          mv unsorted_candidates.filtered.txt unsorted_candidates.txt || true
+
+          # Now sort numerically by latency and keep top 20
           if [ -s unsorted_candidates.txt ]; then
-            sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt 2>/dev/null || head -n 20 unsorted_candidates.txt > candidates.txt
+            sort -n -k1,1 unsorted_candidates.txt | head -n 20 > candidates.txt || cp unsorted_candidates.txt candidates.txt
           else
             touch candidates.txt
           fi
@@ -147,26 +174,29 @@ jobs:
           BEST_LATENCY=""
 
           if [ -s candidates.txt ]; then
-            read -r BEST_LATENCY BEST_IP < candidates.txt || true
+            # read safest way
+            read -r BEST_LATENCY BEST_IP < <(head -n1 candidates.txt) || true
             echo "🎯 Best IP selected (lowest ping): $BEST_IP with ${BEST_LATENCY}ms"
           else
             echo "🟡 No live proxies found in current scan results"
           fi
 
-          if [ -z "${BEST_IP}" ] && [ -f "${CACHE_FILE}" ]; then
+          # Fallback to cached IP if nothing found
+          if [ -z "${BEST_IP:-}" ] && [ -f "${CACHE_FILE}" ]; then
             echo "🔁 Attempting to use cached IP as fallback..."
             CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
-            if [[ "$CACHED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            if [[ "$CACHED_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
               IFS='.' read -ra OCTETS <<< "$CACHED_IP"
               VALID=true
               for octet in "${OCTETS[@]}"; do
-                if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+                if [ -z "$octet" ] || [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
                   VALID=false
                   break
                 fi
               done
               if [ "$VALID" = true ]; then
                 BEST_IP="$CACHED_IP"
+                BEST_LATENCY="(cached)"
                 echo "✅ Using cached IP: $BEST_IP"
               else
                 echo "⚠️ Cached IP invalid: ${CACHED_IP}"
@@ -176,14 +206,19 @@ jobs:
             fi
           fi
 
-          if [ -z "${BEST_IP}" ]; then
+          if [ -z "${BEST_IP:-}" ]; then
             echo "❌ FATAL: No valid IP available from scan or cache"
-            tail -n 150 "$LOG" || true
+            echo "=== Last 200 lines of scanner log for debugging ==="
+            tail -n 200 "$LOG" || true
             exit 1
           fi
 
+          # Persist and set outputs
           echo -n "$BEST_IP" > "${CACHE_FILE}"
+          # export to GITHUB_OUTPUT properly (supports multiline safe)
           echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
+          # Also save candidate list for debugging artifact
+          echo "=> Final chosen IP: ${BEST_IP} (latency: ${BEST_LATENCY})"
           echo "✅ Scanner step completed successfully"
 
       - name: Upload scan.log for debugging (always)
@@ -256,15 +291,14 @@ jobs:
           # 2) Put key (use retries)
           put_url="${API_BASE}/accounts/${ACCOUNT_ID}/storage/kv/namespaces/${NAMESPACE_ID}/values/${KEY}"
           attempt=0
-          max_attempts=5
-          sleep_base=2
+          max_attempts=${MAX_CF_RETRIES:-5}
+          sleep_base=${CF_RETRY_BASE_SLEEP:-2}
 
           echo "=> Attempting to PUT key '${KEY}' => '${VALUE}' into namespace ${NAMESPACE_ID}"
 
           while [ $attempt -lt $max_attempts ]; do
             attempt=$((attempt+1))
             echo "=> PUT attempt $attempt/$max_attempts..."
-            # Use curl to PUT raw body
             http_status=$(curl -s -o /tmp/cf_put_resp -w "%{http_code}" -X PUT \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: text/plain" \
@@ -286,6 +320,7 @@ jobs:
                 sleep $sleep_seconds
               else
                 echo "❌ All PUT attempts failed. Exiting."
+                cat /tmp/cf_put_resp || true
                 exit 1
               fi
             fi
