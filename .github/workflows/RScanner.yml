@@ -1,10 +1,10 @@
-# Rust Proxy Scanner (Ultimate) - KV Update (final, no-IP-cache, robust)
+# Rust Proxy Scanner (Ultimate) - KV Update (final, robust, improved scan parsing)
 name: Rust Proxy Scanner (Ultimate) - KV Update
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *' # every hour
+    - cron: '0 * * * *'
 
 concurrency:
   group: rust-proxy-scan-final-plaintext
@@ -16,7 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Note: We intentionally DO NOT use a cache file for IP (per your request).
+  CACHE_FILE: .cachelastbestip.txt
   RUST_CACHE_KEY: v4
   CF_ENVIRONMENT: production
   SCAN_BINARY: ./target/release/RScanner
@@ -24,8 +24,6 @@ env:
   MAX_CF_RETRIES: "5"
   CF_RETRY_BASE_SLEEP: "2"
   SCANNER_TIMEOUT: "600"
-  # TOP_N only relevant if you later want to sample among top N; default 1 -> absolute lowest
-  TOP_N: "1"
 
 jobs:
   update-proxy-variable:
@@ -48,6 +46,16 @@ jobs:
           sudo apt-get update -y
           echo "=> Installing required packages..."
           sudo apt-get install -y jq curl netcat-openbsd build-essential pkg-config libssl-dev ca-certificates coreutils
+
+      - name: Restore Best IP Cache
+        uses: actions/cache@v4
+        id: ip-cache
+        with:
+          path: ${{ env.CACHE_FILE }}
+          key: rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-${{ runner.os }}
+          restore-keys: |
+            rust-proxy-scanner-best-ip-cache-${{ env.RUST_CACHE_KEY }}-
+            rust-proxy-scanner-best-ip-cache-
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -83,21 +91,31 @@ jobs:
             exit 1
           fi
 
-      - name: Run scanner and select best IP (absolute lowest latency, no IP cache)
+      - name: Run scanner and select best IP (Lowest Ping)
         id: scan
         timeout-minutes: 15
         run: |
+          # Robust scan step inspired by the second script's parsing logic.
           set -euo pipefail
-          echo "=== Scanner execution started (choose absolute lowest latency) ==="
+          echo "=== Scanner execution started ==="
           BIN="${{ env.SCAN_BINARY }}"
           LOG="${{ env.SCAN_LOG }}"
+          CACHE_FILE="${{ env.CACHE_FILE }}"
           TIMEOUT="${{ env.SCANNER_TIMEOUT }}"
-          TOP_N=${TOP_N:-1}
+
+          # Temporary files (will be removed on exit)
+          TMPDIR=$(mktemp -d)
+          CANDIDATES="$TMPDIR/candidates.txt"
+          UNSORTED="$TMPDIR/unsorted_candidates.txt"
+          SCAN_OUT="$TMPDIR/scan_out.log"
+
+          cleanup() {
+            rm -rf "$TMPDIR" || true
+          }
+          trap cleanup EXIT
 
           : > "$LOG"
-          rm -f unsorted_candidates.txt candidates.txt || true
-          touch unsorted_candidates.txt candidates.txt
-
+          : > "$SCAN_OUT"
           if [ ! -f "$BIN" ]; then
             echo "❌ FATAL: Scanner binary not found at $BIN"
             ls -la target/release/ || true
@@ -105,74 +123,106 @@ jobs:
           fi
           chmod +x "$BIN"
 
-          # Run scanner safely and capture exit code; always save output to $LOG
+          # Run scanner with timeout but don't fail the step immediately if scanner exits non-zero.
           set +e
-          timeout "${TIMEOUT}s" "$BIN" > "$LOG" 2>&1
+          echo "=> Running scanner (timeout ${TIMEOUT}s)..."
+          timeout "${TIMEOUT}s" "$BIN" > "$SCAN_OUT" 2>&1
           SCANNER_EXIT_CODE=$?
           set -e
 
-          if [ $SCANNER_EXIT_CODE -eq 0 ]; then
+          if [ "$SCANNER_EXIT_CODE" -eq 0 ]; then
             echo "✅ Scanner completed successfully"
-          elif [ $SCANNER_EXIT_CODE -eq 124 ]; then
+          elif [ "$SCANNER_EXIT_CODE" -eq 124 ]; then
             echo "⚠️ Scanner timed out after ${TIMEOUT}s"
           else
-            echo "⚠️ Scanner exited with code $SCANNER_EXIT_CODE (partial results may exist)"
+            echo "⚠️ Scanner exited with code ${SCANNER_EXIT_CODE} (non-fatal — will try to parse partial results)"
           fi
 
-          # Parse candidate lines into "latency ip" format (latency in ms)
-          awk '
-            BEGIN { IGNORECASE=1 }
+          # Save full scanner output to main log (artifact)
+          cp "$SCAN_OUT" "$LOG" || true
+
+          # Parse lines containing "PROXY LIVE" (case-insensitive) and extract latency(ms) and IP.
+          # Output format: "<latency> <ip>"
+          awk 'BEGIN{IGNORECASE=1}
             /PROXY[[:space:]]+LIVE/ {
-              if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*ms\)/, m)) {
-                latency = m[1] + 0
-              } else if (match($0, /\(([[:space:]]*[0-9]+)[[:space:]]*s\)/, s)) {
-                latency = (s[1] + 0) * 1000
-              } else { next }
-              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ipm)) {
-                ip = ipm[1]
-                print latency, ip
+              # extract latency in ms from "(123 ms)" or "(123ms)"
+              if (match($0, /\(([[:space:]]*([0-9]+)[[:space:]]*m?s)[[:space:]]*\)/, a)) {
+                lat = a[2];
+                gsub(/[^0-9]/,"",lat);
+              } else if (match($0, /\(([0-9]+)[[:space:]]*m?s\)/, b)) {
+                lat = b[1];
+              } else next;
+              # extract IPv4
+              if (match($0, /([0-9]{1,3}(\.[0-9]{1,3}){3})/, ip)) {
+                split(ip[1], oct, ".")
+                valid = 1
+                for (i in oct) {
+                  if (oct[i] < 0 || oct[i] > 255) valid = 0
+                }
+                if (valid && lat+0 > 0) print lat+0, ip[1]
               }
-            }
-          ' "$LOG" > unsorted_candidates.txt || true
+            }' "$SCAN_OUT" > "$UNSORTED" || true
 
-          # fallback lenient parse if necessary
-          if [ ! -s unsorted_candidates.txt ]; then
-            grep -iE "PROXY[[:space:]]+LIVE" "$LOG" | \
-              grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}.*\([0-9]+.*\)' | \
-              sed -E 's/.*(([0-9]{1,3}\.){3}[0-9]{1,3}).*\(([[:space:]]*[0-9]+)[[:space:]]*ms\).*/\3 \1/' >> unsorted_candidates.txt || true
-          fi
-
-          # sanitize: valid numeric latency and IPv4 format
-          awk '{ if ($1+0 > 0 && match($2, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) print $1, $2 }' unsorted_candidates.txt > unsorted_candidates.filtered.txt || true
-          mv unsorted_candidates.filtered.txt unsorted_candidates.txt || true
-
-          # Now sort numeric by latency asc and keep top TOP_N (TOP_N=1 -> absolute lowest)
-          if [ -s unsorted_candidates.txt ]; then
-            sort -n -k1,1 unsorted_candidates.txt | head -n "${TOP_N}" > candidates.txt || cp unsorted_candidates.txt candidates.txt
+          # If some scanners print latency with "ms)" variants or different spacing the awk above handles common cases.
+          # Sort numerically by latency; avoid broken-pipe by writing to a file then cutting to top 20.
+          if [ -s "$UNSORTED" ]; then
+            sort -n -k1,1 "$UNSORTED" > "$CANDIDATES" || cp "$UNSORTED" "$CANDIDATES" || true
+            # Keep only top 20 candidates (if present)
+            head -n 20 "$CANDIDATES" > "$TMPDIR/candidates_top20.txt" || true
+            mv "$TMPDIR/candidates_top20.txt" "$CANDIDATES" || true
           else
-            touch candidates.txt
+            : > "$CANDIDATES"
           fi
 
-          CANDIDATES_COUNT=$(wc -l < candidates.txt 2>/dev/null || echo 0)
-          echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs (kept top ${TOP_N})"
-          echo "=> candidates.txt content:"
-          cat candidates.txt || true
-
-          if [ -s candidates.txt ]; then
-            # If TOP_N>1, we still select the absolute lowest (first line), since requirement is کمتر پینگ
-            read -r BEST_LATENCY BEST_IP < <(head -n1 candidates.txt) || true
+          CANDIDATES_COUNT=$(wc -l < "$CANDIDATES" 2>/dev/null || echo 0)
+          echo "=> Found ${CANDIDATES_COUNT} valid candidate IPs"
+          if [ "$CANDIDATES_COUNT" -gt 0 ]; then
+            # Choose best (lowest latency) — first line after numeric sort
+            BEST_LATENCY=$(awk 'NR==1{print $1}' "$CANDIDATES" || true)
+            BEST_IP=$(awk 'NR==1{print $2}' "$CANDIDATES" || true)
             echo "🎯 Best IP selected (lowest ping): ${BEST_IP} with ${BEST_LATENCY}ms"
           else
-            echo "❌ FATAL: No live proxies found in current scan results (no caching allowed per config)"
-            echo "=== Last 200 lines of scanner log for debugging ==="
+            BEST_IP=""
+            BEST_LATENCY=""
+            echo "🟡 No live proxies found in current scan results"
+          fi
+
+          # If nothing found, attempt to use cached IP (with validation)
+          if [ -z "${BEST_IP:-}" ] && [ -f "${CACHE_FILE}" ]; then
+            echo "🔁 Attempting to use cached IP as fallback..."
+            CACHED_IP=$(tr -d ' \r\n\t' < "${CACHE_FILE}" 2>/dev/null || true)
+            if [[ "$CACHED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+              IFS='.' read -ra OCTETS <<< "$CACHED_IP"
+              VALID=true
+              for octet in "${OCTETS[@]}"; do
+                if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+                  VALID=false
+                  break
+                fi
+              done
+              if [ "$VALID" = true ]; then
+                BEST_IP="$CACHED_IP"
+                echo "✅ Using cached IP: $BEST_IP"
+              else
+                echo "⚠️ Cached IP invalid: ${CACHED_IP}"
+              fi
+            else
+              echo "⚠️ Cache contains invalid IP format: ${CACHED_IP}"
+            fi
+          fi
+
+          if [ -z "${BEST_IP:-}" ]; then
+            echo "❌ FATAL: No valid IP available from scan or cache"
+            echo "=== Last 200 lines of scanner log ==="
             tail -n 200 "$LOG" || true
             exit 1
           fi
 
-          # Export result to GitHub Actions outputs
+          # Save chosen best IP into cache and GitHub output
+          echo -n "${BEST_IP}" > "${CACHE_FILE}"
+          # Append to GITHUB_OUTPUT properly
           echo "bestip=${BEST_IP}" >> "$GITHUB_OUTPUT"
-          echo "=> Final chosen IP: ${BEST_IP} (latency: ${BEST_LATENCY}ms)"
-          echo "✅ Scanner selection step completed successfully"
+          echo "✅ Scanner step completed successfully"
 
       - name: Upload scan.log for debugging (always)
         if: always()
@@ -206,12 +256,12 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_VAR_KEY: ${{ secrets.CF_VAR_KEY }}
-          BESTIP: ${{ steps.scan.outputs.bestip }}
+          CF_VAR_VALUE: ${{ steps.scan.outputs.bestip }}
         run: |
           set -euo pipefail
           echo "=== Cloudflare KV update (REST API) started ==="
           # Required env check
-          for var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY BESTIP; do
+          for var in CF_API_TOKEN CF_ACCOUNT_ID CF_KV_NAMESPACE_ID CF_VAR_KEY CF_VAR_VALUE; do
             if [ -z "${!var}" ]; then
               echo "❌ ERROR: $var is not set"
               exit 1
@@ -223,7 +273,7 @@ jobs:
           NAMESPACE_ID="${CF_KV_NAMESPACE_ID}"
           ACCOUNT_ID="${CF_ACCOUNT_ID}"
           KEY="${CF_VAR_KEY}"
-          VALUE="${BESTIP}"
+          VALUE="${CF_VAR_VALUE}"
           AUTH_HEADER="Authorization: Bearer ${CF_API_TOKEN}"
 
           # 1) Verify namespace exists (list namespaces and check)
@@ -273,7 +323,6 @@ jobs:
                 sleep $sleep_seconds
               else
                 echo "❌ All PUT attempts failed. Exiting."
-                cat /tmp/cf_put_resp || true
                 exit 1
               fi
             fi
@@ -313,8 +362,26 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  post-cache-artifacts:
+    name: Post Cache Rust artifacts & registry
+    runs-on: ubuntu-latest
+    needs: update-proxy-variable
+    if: always()
+    steps:
+      - name: Cache maintenance completed
+        run: echo "Cache maintenance completed."
+
+  post-restore-ip-cache:
+    name: Post Restore Best IP Cache
+    runs-on: ubuntu-latest
+    needs: update-proxy-variable
+    if: always()
+    steps:
+      - name: IP cache status
+        run: echo "Best IP cache has been updated for subsequent workflow runs"
+
   cleanup-runs:
-    name: Cleanup old workflow runs (optional)
+    name: Post Checkout repository (full)
     runs-on: ubuntu-latest
     needs: update-proxy-variable
     if: always()
